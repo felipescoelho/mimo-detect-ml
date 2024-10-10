@@ -9,27 +9,30 @@ Sep 17, 2024
 
 import os
 import torch
+import numpy as np
 from math import log2
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 from .qam import qammod
-from .ofdm import ofdmmod
+from .utils import onehot_map, awgn, keep_quatized
 
 
-class OFDMDatasetAutoEncoder(Dataset):
-    def __init__(self, N: int, M: int, mod_size: int, n_frames: int,
-                 seed: int | None = None, dataset_path: str | None = None):
+class DatasetQAM(Dataset):
+    def __init__(self, K: int, N: int, mod_size: int, ensemble: int,
+                 H: np.ndarray, snr_dB: np.ndarray, seed: int | None = None,
+                 dataset_path: str | None = None):
         """Generates the dataset for the autoencoder.
         
         Args
         ----
+        K : int
+            number of symbols
         N : int
-            length of the DFT
-        M : int
-            number of blocks in OFDM frame
+            number of antennas at the receiver
         mod_size : int
             modulation size for QAM
-        n_frames : int
-            number of frames in dataset
+        ensemble : int
+            number of iterations
         seed : int | None = None
             seed for RNG
         dataset_path : str | None = None
@@ -37,95 +40,173 @@ class OFDMDatasetAutoEncoder(Dataset):
         """
 
         super().__init__()
-        if seed is not None:
-            torch.random.seed(seed)
+        self.rng = np.random.default_rng(seed)
         if os.path.isfile(dataset_path):
-            self.source_bits, self.modulated_bits, self.ofdm_frames = \
-                torch.load(dataset_path)
+            self.X, self.Y, self.labels, self.onehot_map = torch.load(dataset_path)
         else:
-            self.source_bits = torch.randint(
-                2, size=(n_frames, int(N*M*log2(mod_size)))
+            source_bits = self.rng.integers(
+                0, 1, size=(int(ensemble*K*log2(mod_size)),), endpoint=True
             )
-            self.modulated_bits = qammod(self.source_bits, mod_size)
-            self.ofdm_frames = ofdmmod(self.modulated_bits, N)
-            torch.save([self.source_bits, self.modulated_bits,
-                        self.ofdm_frames], dataset_path)
+            symbols = qammod(source_bits, mod_size).reshape((ensemble, K))
+            x = np.zeros((ensemble, int(2*K)))
+            y = np.zeros((ensemble, int(2*N)))
+            print('Allocate data to save:')
+            for idx in tqdm(range(ensemble)):
+                noisy_symbols = awgn(symbols[idx, :], self.rng.choice(snr_dB))
+                received = H @ noisy_symbols
+                y[idx, :] = np.hstack((received.real, received.imag))
+                # for the reference:
+                x[idx, :] = np.hstack((symbols[idx, :].real,
+                                       symbols[idx, :].imag))
+            x_onehot, self.onehot_map = onehot_map(x)
+            
+            # import pdb; pdb.set_trace()
+            self.X = torch.from_numpy(x)
+            self.Y = torch.from_numpy(y)
+            self.labels = torch.from_numpy(x_onehot)
+
+            torch.save([self.X, self.Y, self.labels, self.onehot_map], dataset_path)
 
     def __len__(self):
-        return self.modulated_bits.shape[0]
+        return self.X.shape[0]
     
     def __getitem__(self, index):
-        x = self.modulated_bits[index, :, :]
-        label = self.modulated_bits[index, :, :]
-        return x, label
+        y = self.Y[index, :]
+        label = self.labels[index, :, :]
+        return y, label
 
 
 class MLP(torch.nn.Module):
-    """Multi-layer perceptron."""
+    """Multilayer Perceptron"""
 
-    def __init__(self):
-        super.__init__()
-        
-
-
-class AutoEncoder(torch.nn.Module):
-    """"""
-
-    def __init__(self, input_size, hidden_layer, latent_layer):
+    def __init__(self, N, K):
         super().__init__()
+        input_size = int(2*N)
+        hidden_features = int(10*K)
+        output_size = int(2*K*4)
+        self.fc1 = torch.nn.Linear(input_size, hidden_features)
+        self.fc2 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc3 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc4 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc5 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc6 = torch.nn.Linear(hidden_features, output_size)
+        self.logit_shape = (4, int(2*K))
 
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Linear(input_size, hidden_layer),
-            torch.nn.Sigmoid(),
-            torch.nn.Linear(hidden_layer, latent_layer)
-        )
-
-        self.decoder = torch.nn.Sequential(
-            torch.nn.Linear(latent_layer, hidden_layer),
-            torch.nn.Sigmoid(),
-            torch.nn.Linear(hidden_layer, input_size)
-        )
-    
     def forward(self, x):
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
+        
+        x = torch.nn.functional.relu(self.fc1(x))
+        x = torch.nn.functional.relu(self.fc2(x))
+        x = torch.nn.functional.relu(self.fc3(x))
+        x = torch.nn.functional.relu(self.fc4(x))
+        x = torch.nn.functional.relu(self.fc5(x))
+        x = self.fc6(x)
+        x = x.reshape(x.shape[0], *self.logit_shape)
 
-        return decoded
+        return x
 
 
-def train(dataloader: DataLoader, model: torch.nn.Module,
-          loss_fn: torch.nn.Module, optimizer: torch.nn.Module, device):
+class MLPQuantized(torch.nn.Module):
+    """Multilayer Perceptron but SOPOT"""
+
+    def __init__(self, N: int, K: int, MN_ratio: float):
+        super().__init__()
+        input_size = int(2*N)
+        hidden_features = int(10*K)
+        output_size = int(2*K*4)
+        self.fc1 = torch.nn.Linear(input_size, hidden_features)
+        self.fc2 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc3 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc4 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc5 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc6 = torch.nn.Linear(hidden_features, output_size)
+        self.softmax_size = (4, int(2*K))
+        self.MN_ratio = MN_ratio
+
+    def forward(self, x):
+        
+        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
+            self.fc1(x), self.MN_ratio
+        )), self.MN_ratio)
+        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
+            self.fc2(x), self.MN_ratio
+        )), self.MN_ratio)
+        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
+            self.fc3(x), self.MN_ratio
+        )), self.MN_ratio)
+        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
+            self.fc4(x), self.MN_ratio
+        )), self.MN_ratio)
+        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
+            self.fc5(x), self.MN_ratio
+        )), self.MN_ratio)
+        x = keep_quatized(self.fc6(x), self.MN_ratio)
+        x = x.reshape(x.shape[0], *self.softmax_size)
+
+        return x
+
+
+def train_model(dataloader: DataLoader, model: torch.nn.Module,
+                loss_fn: torch.nn.Module, optimizer: torch.nn.Module, device):
     """
     Method to train model using pytorch.
     """
     size = len(dataloader.dataset)
+    num_batches = len(dataloader)
     model.train()
+    avg_train_loss = 0
     for batch, (X, y) in enumerate(dataloader):
         X, y = X.to(device), y.to(device)
         # Compute
-        y_hat = model(X)
+        y_hat = model(X.float())
         loss = loss_fn(y_hat, y)
         # Backpropagation
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
-
+        avg_train_loss += loss.item()
         if batch % 100 == 0:
             loss, current = loss.item(), (batch+1)*len(X)
-            print(f'loss: {loss:.4f} [{current:d}/{size:d}]')
+            print(f'loss: {loss:.7f} [{current:d}/{size:d}]')
+    avg_train_loss /= num_batches
+
+    return avg_train_loss
 
 
-def test(dataloader: DataLoader, model: torch.nn.Module,
-         loss_fn:torch.nn.Module, device):
+def test_model(dataloader: DataLoader, model: torch.nn.Module,
+               loss_fn:torch.nn.Module, device):
     """
     Method to test model using pytorch.
     """
     size = len(dataloader.dataset)
     num_batches = len(dataloader)
     model.eval()
-    test_loss, correct = 0, 0
+    test_loss = 0
+    accuracy = 0
     with torch.no_grad():
         for X, y in dataloader:
             X, y = X.to(device), y.to(device)
-            y_hat = model(X)
-            # test_loss += 
+            y_hat = model(X.float())
+            test_loss += loss_fn(y_hat, y).item()
+            accuracy += (y_hat.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
+    test_loss /= num_batches
+    accuracy /= (size*64)
+    msg = f'Test Error: \n Accuracy: {(100*accuracy):.2f}%, ' \
+        + f'Avg Loss: {test_loss:.7f} \n'
+    print(msg)
+    
+    return test_loss
+
+
+def run_model(dataloader: DataLoader, model: torch.nn.Module, device):
+    """Method to run model using pytorch"""
+    size = len(dataloader.dataset)
+    accuracy = 0
+    model.eval()
+    with torch.no_grad():
+        for X, y in tqdm(dataloader):
+            X, y = X.to(device), y.to(device)
+            y_hat = model(X.float())
+            accuracy += (y_hat.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
+    accuracy /= (size*64)
+
+    return accuracy

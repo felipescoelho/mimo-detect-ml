@@ -7,52 +7,53 @@ Sep 25, 2024
 """
 
 
+import torch
 import numpy as np
 
 
-def mpgbp(x: np.ndarray, N: int, P: int, bitplane_range: tuple, epsilon=1e-12):
+def mpgbp(x: torch.Tensor, M_max: int, P: int, device: str, epsilon=1e-12):
     """
     Method to perform the Matching Pursuits with Generalized Bit Plane
     (MPGBP) algortihm for vector quantization.
     
     Args
     ----
-    x : np.ndarray
+    x : torch.Tensor
         input vector
-    N : int
-        maximum number of non zero elements (SPT -- signed powers of two)
+    M_max : int
+        maximum number of SPT in vector
     P : int
         number of non zero elements in codeword components
-    bitplane_range : tuple
-        range for the bitplane (min_bp, max_bp) value for 2^{bit plane},
-        i.e., the bit plane goes from 2^{min_bp} to 2^{max_bp}
+    device : str
+        device where we compute the tensors
     epsilon : float (default=1e-12)
         approximation threshold
     """
 
-    x_hat = np.zeros((len(x),))
-    residue = x.copy()
-    count = 0
-    while count < N:
-        codeword = np.zeros((N,))
-        idx_sort = np.argsort(-np.abs(residue))
+
+    x_hat = torch.zeros((len(x),), device=device)
+    residue = x.detach().clone()
+    M = 0  # Number of SPT
+    while M < M_max:
+        codeword = torch.zeros((len(x),), device=device)
+        idx_sort = torch.argsort(-torch.abs(residue))
         for idx in range(P):
             idx = idx_sort[idx]
-            codeword[idx] = np.sign(residue[idx])
-        codeword_normalized = codeword/np.linalg.norm(codeword)
-        ip = np.dot(residue, codeword_normalized) / np.linalg.norm(codeword)
-        powers = -np.ceil(np.log2(3/(4*ip)))
+            codeword[idx] = torch.sign(residue[idx])
+        codeword_normalized = codeword/torch.norm(codeword, p=2)
+        ip = torch.dot(residue, codeword_normalized)/torch.norm(codeword, p=2)
+        powers = -torch.ceil(torch.log2(3/(4*ip)))
         spt = 2**powers
         residue -= spt*codeword
         x_hat += spt*codeword
-        count += spt_count(x_hat, bitplane_range)
-        if np.linalg.norm(residue) <= epsilon:
+        M += spt_count(x_hat, device)
+        if torch.norm(residue, p=2) <= epsilon:
             break
     
     return x_hat
 
 
-def spt_count(x_hat: np.ndarray, bitplane_range: tuple):
+def spt_count(x_hat: torch.Tensor, device: str):
     """
     Method to count the number of signed powers of two in approximation.
 
@@ -60,43 +61,18 @@ def spt_count(x_hat: np.ndarray, bitplane_range: tuple):
     ----
     x_hat : torch.Tensor
         approximated input vector.
-    bitplane_range : tuple
-        range for the bitplane (min_bp, max_bp) value for 2^{bit plane},
-        i.e., the bit plane goes from 2^{min_bp} to 2^{max_bp}
+    device : str
+        device where we compute the tensors
     """
 
 
     K = len(x_hat)
-    count = np.zeros((K,))
-    bitplane_axis = gen_bitplane(bitplane_range)
+    count = torch.zeros((K,), device=device)
     for idx in range(K):
-        residue = x_hat[idx]
+        residue = torch.abs(x_hat[idx])
         while residue != 0:
-            bitplane = np.floor(np.log2(residue))
-            bitplane_axis = allocate_power(bitplane_axis, bitplane,
-                                           bitplane_range)
-            residue = np.abs(residue - 2**bitplane)
+            bitplane = torch.floor(torch.log2(residue))
+            residue = torch.abs(residue - 2**bitplane)
             count[idx] += 1
     
-    return count
-
-
-def gen_bitplane(bitplane_range: tuple):
-    """Method to generate bitplane from bitplane range."""
-
-    min_bp, max_bp = bitplane_range
-    bitplane = np.zeros((max_bp-min_bp+1,)) if max_bp > 0 and min_bp < 0 \
-        else np.zeros((max_bp-min_bp,))
-    
-    return bitplane
-
-
-def allocate_power(bitplane_axis: np.ndarray, bitplane: np.ndarray,
-                   bitplane_range: tuple):
-    """Method to allocate powers in bitplane."""
-
-    min_bp, max_bp = bitplane_range
-    idx = bitplane.copy()+1 if max_bp > 0 and min_bp < 0 else bitplane.copy()
-    bitplane_axis[idx] = 1
-
-    return bitplane_axis
+    return torch.sum(count)

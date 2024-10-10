@@ -1,161 +1,137 @@
 """qam.py
 
-Script to handle QAM.
+Script with QAM related functions - Numpy-based.
 
 luizfelipe.coelho@smt.ufrj.br
-Sep 17, 2024
+Sep 30, 2024
 """
 
 
-import torch
-from math import log2
+import numpy as np
 from tqdm import tqdm
 
 
-def qammod(data: torch.Tensor, mod_size: int):
+def qammod(data: np.ndarray, mod_size: int):
     """
-    QAM modulation using gray coding and separating real from imaginary
-    parts in the complex number.
+    QAM modulation using Gray coding.
 
     Args
     ----
-    data : torch.Tensor
+    data : np.ndarray
         bit stream
     mod_size : int
-        mulation size, choose between 2, 4, and 16
+        modulation size, 2, 4, or 16.
     """
 
-    spam = int(data.shape[1]/log2(mod_size))
-    data_vect = data.reshape((data.shape[0], int(log2(mod_size)), spam))
-    data_out = torch.zeros((data.shape[0], spam, 2))
+    out_len = int(len(data)/np.log2(mod_size))
+    data_vect = data.reshape((out_len, int(np.log2(mod_size))))
+    data_out = np.zeros((out_len,), dtype=np.complex128)
     match mod_size:
         case 2:
-            for idx0 in range(data.shape[0]):
-                for idx1 in range(spam):
-                    data_out[idx0, idx1, 0] = \
-                        1 if data_vect[idx0, :, idx1] == 1 else -1
+            for idx in range(out_len):
+                data_out[idx] = 1 if data_vect[idx, :] == 1 else -1
         case 4:
-            for idx0 in range(data.shape[0]):
-                for idx1 in range(spam):
-                    sym0 = torch.tensor([0, 0])
-                    sym1 = torch.tensor([0, 1])
-                    sym2 = torch.tensor([1, 0])
-
-                    symbol = data_vect[idx0, :, idx1]
-                    if symbol.equal(sym0):  # 00
-                        data_out[idx0, idx1, 0] = -1
-                        data_out[idx0, idx1, 1] = -1
-                    elif symbol.equal(sym1):  # 01
-                        data_out[idx0, idx1, 0] = -1
-                        data_out[idx0, idx1, 1] = 1
-                    elif symbol.equal(sym2):  # 10
-                        data_out[idx0, idx1, 0] = 1
-                        data_out[idx0, idx1, 1] = -1
-                    else:  # 11
-                        data_out[idx0, idx1, 0] = 1
-                        data_out[idx0, idx1, 1] = 1
+            sym0 = np.array((0, 0))
+            sym1 = np.array((0, 1))
+            sym2 = np.array((1, 0))
+            for idx in range(out_len):
+                if np.array_equal(data_vect[idx, :], sym0):  # 00
+                    data_out[idx] = -1-1j
+                elif np.array_equal(data_vect[idx, :], sym1):  # 01
+                    data_out[idx] = -1+1j
+                elif np.array_equal(data_vect[idx, :], sym2):  # 10
+                    data_out[idx] = 1-1j
+                else:  # 11
+                    data_out[idx] = 1+1j
         case 16:
-            for idx0 in tqdm(range(data.shape[0])):
-                for idx1 in range(spam):
-                    sym00 = torch.tensor([0, 0, 0, 0])
-                    sym01 = torch.tensor([0, 0, 0, 1])
-                    sym02 = torch.tensor([0, 0, 1, 0])
-                    sym03 = torch.tensor([0, 0, 1, 1])
-                    sym04 = torch.tensor([0, 1, 0, 0])
-                    sym05 = torch.tensor([0, 1, 0, 1])
-                    sym06 = torch.tensor([0, 1, 1, 0])
-                    sym07 = torch.tensor([0, 1, 1, 1])
-                    sym08 = torch.tensor([1, 0, 0, 0])
-                    sym09 = torch.tensor([1, 0, 0, 1])
-                    sym10 = torch.tensor([1, 0, 1, 0])
-                    sym11 = torch.tensor([1, 0, 1, 1])
-                    sym12 = torch.tensor([1, 1, 0, 0])
-                    sym13 = torch.tensor([1, 1, 0, 1])
-                    sym14 = torch.tensor([1, 1, 1, 0])
-                    
-                    symbol = data_vect[idx0, :, idx1]
-                    if symbol.equal(sym00):  # 0000
-                        data_out[idx0, idx1, 0] = -3
-                        data_out[idx0, idx1, 1] = -3
-                    elif symbol.equal(sym01):  # 0001
-                        data_out[idx0, idx1, 0] = -3
-                        data_out[idx0, idx1, 1] = -1
-                    elif symbol.equal(sym02):  # 0010
-                        data_out[idx0, idx1, 0] = -3
-                        data_out[idx0, idx1, 1] = 3
-                    elif symbol.equal(sym03):  # 0011
-                        data_out[idx0, idx1, 0] = -3
-                        data_out[idx0, idx1, 1] = 1
-                    elif symbol.equal(sym04):  # 0100
-                        data_out[idx0, idx1, 0] = -1
-                        data_out[idx0, idx1, 1] = -3
-                    elif symbol.equal(sym05):  # 0101
-                        data_out[idx0, idx1, 0] = -1
-                        data_out[idx0, idx1, 1] = -1
-                    elif symbol.equal(sym06):  # 0110
-                        data_out[idx0, idx1, 0] = -1
-                        data_out[idx0, idx1, 1] = 3
-                    elif symbol.equal(sym07):  # 0111
-                        data_out[idx0, idx1, 0] = -1
-                        data_out[idx0, idx1, 1] = 1
-                    elif symbol.equal(sym08):  # 1000
-                        data_out[idx0, idx1, 0] = 3
-                        data_out[idx0, idx1, 1] = -3
-                    elif symbol.equal(sym09):  # 1001
-                        data_out[idx0, idx1, 0] = 3
-                        data_out[idx0, idx1, 1] = -1
-                    elif symbol.equal(sym10):  # 1010
-                        data_out[idx0, idx1, 0] = 3
-                        data_out[idx0, idx1, 1] = 3
-                    elif symbol.equal(sym11):  # 1011
-                        data_out[idx0, idx1, 0] = 3
-                        data_out[idx0, idx1, 1] = 1
-                    elif symbol.equal(sym12):  # 1100
-                        data_out[idx0, idx1, 0] = 1
-                        data_out[idx0, idx1, 1] = -3
-                    elif symbol.equal(sym13):  # 1101
-                        data_out[idx0, idx1, 0] = 1
-                        data_out[idx0, idx1, 1] = -1
-                    elif symbol.equal(sym14):  # 1110
-                        data_out[idx0, idx1, 0] = 1
-                        data_out[idx0, idx1, 1] = 3
-                    else:  # 1111
-                        data_out[idx0, idx1, 0] = 1
-                        data_out[idx0, idx1, 1] = 1
+            sym00 = np.array((0, 0, 0, 0))
+            sym01 = np.array((0, 0, 0, 1))
+            sym02 = np.array((0, 0, 1, 0))
+            sym03 = np.array((0, 0, 1, 1))
+            sym04 = np.array((0, 1, 0, 0))
+            sym05 = np.array((0, 1, 0, 1))
+            sym06 = np.array((0, 1, 1, 0))
+            sym07 = np.array((0, 1, 1, 1))
+            sym08 = np.array((1, 0, 0, 0))
+            sym09 = np.array((1, 0, 0, 1))
+            sym10 = np.array((1, 0, 1, 0))
+            sym11 = np.array((1, 0, 1, 1))
+            sym12 = np.array((1, 1, 0, 0))
+            sym13 = np.array((1, 1, 0, 1))
+            sym14 = np.array((1, 1, 1, 0))
+            print('16QAM:')
+            for idx in tqdm(range(out_len)):
+                if np.array_equal(data_vect[idx, :], sym00):  # 0000
+                    data_out[idx] = -3 - 1j*3
+                elif np.array_equal(data_vect[idx, :], sym01):  # 0001
+                    data_out[idx] = -3 - 1j
+                elif np.array_equal(data_vect[idx, :], sym02):  # 0010
+                    data_out[idx] = -3 + 1j*3
+                elif np.array_equal(data_vect[idx, :], sym03):  # 0011
+                    data_out[idx] = -3 + 1j
+                elif np.array_equal(data_vect[idx, :], sym04):  # 0100
+                    data_out[idx] = -1 - 1j*3
+                elif np.array_equal(data_vect[idx, :], sym05):  # 0101
+                    data_out[idx] = -1 - 1j
+                elif np.array_equal(data_vect[idx, :], sym06):  # 0110
+                    data_out[idx] = -1 + 1j*3
+                elif np.array_equal(data_vect[idx, :], sym07):  # 0111
+                    data_out[idx] = -1 + 1j
+                elif np.array_equal(data_vect[idx, :], sym08):  # 1000
+                    data_out[idx] = 3 - 1j*3
+                elif np.array_equal(data_vect[idx, :], sym09):  # 1001
+                    data_out[idx] = 3 - 1j
+                elif np.array_equal(data_vect[idx, :], sym10):  # 1010
+                    data_out[idx] = 3 + 1j*3
+                elif np.array_equal(data_vect[idx, :], sym11):  # 1011
+                    data_out[idx] = 3 + 1j
+                elif np.array_equal(data_vect[idx, :], sym12):  # 1100
+                    data_out[idx] = 1 - 1j*3
+                elif np.array_equal(data_vect[idx, :], sym13):  # 1101
+                    data_out[idx] = 1 - 1j
+                elif np.array_equal(data_vect[idx, :], sym14):  # 1110
+                    data_out[idx] = 1 + 1j*3
+                else:
+                    data_out[idx] = 1 + 1j
     
     return data_out
 
 
-def qamdemod(data: torch.Tensor, mod_size: int):
+def qamdemod(data: np.ndarray, mod_size: int):
     """
-    QAM demoduation using Gray coding and considering that the real and
-    imaginary parts are divided in the complex numbers.
+    QAM demodulation using Gray coding.
     
     Args
     ----
-    data : torch.Tensor
+    data : np.ndarray
         input QAM modulated data
     mod_size : int
         modulation size
     """
 
-    data_vect = torch.zeros((int(log2(mod_size)), data.shape[0]))
+    data_out = np.zeros((len(data), int(np.log2(mod_size))))
     match mod_size:
         case 2:
-            for idx in range(data.shape[0]):
-                data_vect[0, idx] = 1 if data[idx, 0] > 0 else 0
+            for idx, x in np.ndenumerate(data):
+                data_out[idx, :] = 1 if x > 0 else 0
         case 4:
-            symbols = torch.tensor([[-1, -1], [-1, 1], [1, -1], [1, 1]])
-            for idx in range(data.shape[0]):
-                distance = symbols - data[idx, :]
-
+            symbols = np.array([-1-1j, -1+1j, 1-1j, 1+1j])
+            bits = np.array([[0, 0], [0, 1], [1, 0], [1, 1]])
+            for idx, x in np.ndenumerate(data):
+                distance = np.abs(symbols - x)
+                data_out[idx, :] = bits[np.argmin(distance)]
         case 16:
-            symbols = torch.tensor([[-3, -3], [-3, -1], [-3, 3], [-3, 1],
-                                    [-1, -3], [-1, -1], [-1, 3], [-1, 1],
-                                    [3, -3], [3, -1], [3, 3], [3, 1],
-                                    [1, -3], [1, -1], [1, 3], [1, 1]])
-            for idx in range(data.shape[0]):
-                distance = symbols - data[idx, :]
-                print(distance)
+            symbols = np.array([-3-1j*3, -3-1j, -3+1j*3, -3+1j, -1-1j*3, -1-1j,
+                                -1+1j*3, -1+1j, 3-1j*3, 3-1j, 3+1j*3, 3+1j,
+                                1-1j*3, 1-1j, 1+1j*3, 1+1j])
+            bits = np.array([[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0],
+                             [0, 0, 1, 1], [0, 1, 0, 0], [0, 1, 0, 1],
+                             [0, 1, 1, 0], [0, 1, 1, 1], [1, 0, 0, 0],
+                             [1, 0, 0, 1], [1, 0, 1, 0], [1, 0, 1, 1],
+                             [1, 1, 0, 0], [1, 1, 0, 1], [1, 1, 1, 0],
+                             [1, 1, 1, 1]])
+            for idx, x in np.ndenumerate(data):
+                distance = np.abs(symbols - x)
+                data_out[idx, :] = bits[np.argmin(distance)]
     
-    return data_vect.flatten()
+    return data_out
