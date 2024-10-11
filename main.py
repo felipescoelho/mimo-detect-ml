@@ -12,10 +12,13 @@ import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from qtorch.quant import fixed_point_quantize
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from src.model import (DatasetQAM, MLP, MLPQuantized, train_model, test_model,
                        run_model)
-from src.utils import matrix_55_toeplitz, quantize_coefficients
+from src.utils import (matrix_55_toeplitz, quantize_coefficients,
+                       quantize_coefficients2)
 
 
 plt.rcParams.update({
@@ -28,7 +31,7 @@ plt.rcParams.update({
 def arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--mode', default='train', help='Operation mode',
-                        type=str, choices=['train', 'run', 'test'])
+                        type=str, choices=['train', 'run', 'test', 'run2'])
     parser.add_argument('--K', type=int, default=32)
     parser.add_argument('--N', type=int, default=64)
     parser.add_argument('--mod_size', type=int, choices=[2, 4, 16], default=16)
@@ -140,8 +143,18 @@ if __name__ == '__main__':
             model = MLP(N, K).to(device)
             model.load_state_dict(state_dict)
             snr_values = np.arange(*snr_limits, 1)
-            MN_ratio_values = np.array((1., 3., 5., 8))
+            MN_ratio_values = np.array((1., 8, 16.))
             ser = np.zeros((len(MN_ratio_values)+1, len(snr_values)))
+            print('Load Datasets ...')
+            dataset_list = [
+                DatasetQAM(K, N, mod_size, args.n_run, H,
+                           np.array((snr_values[idx])),
+                           dataset_path=os.path.join(
+                               dataset_folder,
+                               f'run_SNR_{snr_values[idx]}.pt'
+                           )) for idx in tqdm(range(len(snr_values)))
+            ]
+            print('Done!')
             for idx_MN, MN_ratio in np.ndenumerate(MN_ratio_values):
                 idx0 = idx_MN[0]
                 quantized_model_path = os.path.join(
@@ -149,7 +162,7 @@ if __name__ == '__main__':
                 )
                 model_quatized = MLP(N, K).to(device)
                 if os.path.isfile(quantized_model_path):
-                    state_dict_quantized = torch.load(model_path)
+                    state_dict_quantized = torch.load(quantized_model_path)
                     model_quatized.load_state_dict(state_dict_quantized)
                 else:
                     state_dict_quantized = quantize_coefficients(
@@ -160,25 +173,92 @@ if __name__ == '__main__':
                                quantized_model_path)
                 for idx_snr, snr_dB in np.ndenumerate(snr_values):
                     idx1 = idx_snr[0]
-                    dataset_path = os.path.join(dataset_folder,
-                                                f'run_SNR_{snr_dB}.pt')
-                    dataset = DatasetQAM(K, N, mod_size, args.n_run, H,
-                                         np.array((snr_dB,)),
-                                         dataset_path=dataset_path)
-                    dataloader = DataLoader(dataset, batch_size=batch_size,
-                                            shuffle=True)
+                    dataloader = DataLoader(
+                        dataset_list[idx1], batch_size=batch_size, shuffle=True
+                    )
+                    if idx0 == 0:
+                        print('Run full precision model')
+                        ser[0, idx1] = run_model(dataloader, model, device)
                     print(f'Run quantized model M/N {MN_ratio} | SNR {snr_dB}')
                     ser[idx0+1, idx1] = run_model(dataloader, model_quatized,
                                                   device)
-                    if idx_MN == 0:
-                        ser[0, idx1] = run_model(dataloader, model, device)
             
             fig = plt.figure(figsize=(width, height))
             ax = fig.add_subplot(111)
-            ax.plot(snr_values, ser[0, :], label='Full Precision')
+            ax.semilogy(snr_values, ser[0, :], label='Full Precision')
             for idx, MN_ratio in np.ndenumerate(MN_ratio_values):
-                ax.plot(snr_values, ser[idx+1, :], label=f'M/N = {MN_ratio}')
-            ax.legend()
+                ax.semilogy(snr_values, ser[idx[0]+1, :],
+                            label=f'M/L = {int(MN_ratio)}')
+            ax.legend(ncols=1)
+            ax.grid()
+            ax.set_xlabel('SNR, dB')
+            ax.set_ylabel('SER')
+            fig.tight_layout()
+
+            fig.savefig(os.path.join(figures_folder, 'ser.eps'),
+                        format='eps', bbox_inches='tight')
+            fig.savefig(os.path.join(figures_folder, 'ser.png'),
+                        format='png', bbox_inches='tight')
+        case 'run2':
+            wl = 8
+            fl = 5
+            channel_path = os.path.join(dataset_folder, 'channel_matrix.npy')
+            model_path = os.path.join(model_folder, 'model_weights.pth')
+            H = np.load(channel_path)
+            state_dict = torch.load(model_path)
+            for key, values in state_dict.items():
+                state_dict[key] = fixed_point_quantize(values, wl, fl)
+            model = MLPQuantized(N, K, wl, fl).to(device)
+            model.load_state_dict(state_dict)
+            snr_values = np.arange(*snr_limits, 1)
+            MN_ratio_values = np.array((1., 8, 16.))
+            ser = np.zeros((len(MN_ratio_values)+1, len(snr_values)))
+            print('Load Datasets ...')
+            dataset_list = [
+                DatasetQAM(K, N, mod_size, args.n_run, H,
+                           np.array((snr_values[idx])),
+                           dataset_path=os.path.join(
+                               dataset_folder,
+                               f'run_SNR_{snr_values[idx]}.pt'
+                           )) for idx in tqdm(range(len(snr_values)))
+            ]
+            print('Done!')
+            for idx_MN, MN_ratio in np.ndenumerate(MN_ratio_values):
+                idx0 = idx_MN[0]
+                quantized_model_path = os.path.join(
+                    model_folder, f'model_weights2_SPT_{int(MN_ratio)}.pth'
+                )
+                model_quatized = MLPQuantized(N, K, wl, fl).to(device)
+                if os.path.isfile(quantized_model_path):
+                    state_dict_quantized = torch.load(quantized_model_path)
+                    model_quatized.load_state_dict(state_dict_quantized)
+                else:
+                    state_dict_quantized = quantize_coefficients2(
+                        state_dict, MN_ratio, wl, fl, device
+                    )
+                    model_quatized.load_state_dict(state_dict_quantized)
+                    torch.save(model_quatized.state_dict(),
+                               quantized_model_path)
+                for idx_snr, snr_dB in np.ndenumerate(snr_values):
+                    idx1 = idx_snr[0]
+                    dataloader = DataLoader(
+                        dataset_list[idx1], batch_size=batch_size, shuffle=True
+                    )
+                    if idx0 == 0:
+                        print('Run full precision model')
+                        ser[0, idx1] = run_model(dataloader, model, device)
+                    print(f'Run quantized model M/N {MN_ratio} | SNR {snr_dB}')
+                    ser[idx0+1, idx1] = run_model(dataloader, model_quatized,
+                                                  device)
+            
+            fig = plt.figure(figsize=(width, height))
+            ax = fig.add_subplot(111)
+            ax.semilogy(snr_values, ser[0, :], label='Full Precision')
+            for idx, MN_ratio in np.ndenumerate(MN_ratio_values):
+                ax.semilogy(snr_values, ser[idx[0]+1, :],
+                            label=f'M/L = {int(MN_ratio)}')
+            ax.legend(ncols=1)
+            ax.grid()
             ax.set_xlabel('SNR, dB')
             ax.set_ylabel('SER')
             fig.tight_layout()

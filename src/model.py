@@ -13,6 +13,7 @@ import numpy as np
 from math import log2
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from qtorch.quant import fixed_point_quantize
 from .qam import qammod
 from .utils import onehot_map, awgn, keep_quatized
 
@@ -108,7 +109,7 @@ class MLP(torch.nn.Module):
 class MLPQuantized(torch.nn.Module):
     """Multilayer Perceptron but SOPOT"""
 
-    def __init__(self, N: int, K: int, MN_ratio: float):
+    def __init__(self, N: int, K: int, wl: int, fl: int):
         super().__init__()
         input_size = int(2*N)
         hidden_features = int(10*K)
@@ -120,26 +121,23 @@ class MLPQuantized(torch.nn.Module):
         self.fc5 = torch.nn.Linear(hidden_features, hidden_features)
         self.fc6 = torch.nn.Linear(hidden_features, output_size)
         self.softmax_size = (4, int(2*K))
-        self.MN_ratio = MN_ratio
+        self.wl = wl
+        self.fl = fl
 
     def forward(self, x):
         
-        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
-            self.fc1(x), self.MN_ratio
-        )), self.MN_ratio)
-        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
-            self.fc2(x), self.MN_ratio
-        )), self.MN_ratio)
-        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
-            self.fc3(x), self.MN_ratio
-        )), self.MN_ratio)
-        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
-            self.fc4(x), self.MN_ratio
-        )), self.MN_ratio)
-        x = keep_quatized(torch.nn.functional.relu(keep_quatized(
-            self.fc5(x), self.MN_ratio
-        )), self.MN_ratio)
-        x = keep_quatized(self.fc6(x), self.MN_ratio)
+        x = torch.nn.functional.relu(self.fc1(x))
+        x = fixed_point_quantize(x, self.wl, self.fl)
+        x = torch.nn.functional.relu(self.fc2(x))
+        x = fixed_point_quantize(x, self.wl, self.fl)
+        x = torch.nn.functional.relu(self.fc3(x))
+        x = fixed_point_quantize(x, self.wl, self.fl)
+        x = torch.nn.functional.relu(self.fc4(x))
+        x = fixed_point_quantize(x, self.wl, self.fl)
+        x = torch.nn.functional.relu(self.fc5(x))
+        x = self.fc6(x)
+        x = fixed_point_quantize(x, self.wl, self.fl)
+        
         x = x.reshape(x.shape[0], *self.softmax_size)
 
         return x
@@ -201,12 +199,49 @@ def run_model(dataloader: DataLoader, model: torch.nn.Module, device):
     """Method to run model using pytorch"""
     size = len(dataloader.dataset)
     accuracy = 0
+    ser = 0
     model.eval()
     with torch.no_grad():
         for X, y in tqdm(dataloader):
             X, y = X.to(device), y.to(device)
             y_hat = model(X.float())
             accuracy += (y_hat.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
+            ser += (y_hat.argmax(1) != y.argmax(1)).type(torch.float).sum().item()
     accuracy /= (size*64)
+    ser /= (size*64)
 
-    return accuracy
+    return ser
+
+
+def run_model_quantized(dataloader: DataLoader, model: torch.nn.Module,
+                        wl: int, fl: int, device):
+    """Method to run quantized model.
+    
+    Args
+    ----
+    dataloader : DataLoader
+        dataset loader
+    model : torch.nn.Module
+        model we want to run
+    wl : int
+        wordlength for our quantization
+    fl : int
+        fractional length
+    device : str
+        device where we wanto to compute
+    """
+    size = len(dataloader.dataset)
+    accuracy = 0
+    ser = 0
+    model.eval()
+    with torch.no_grad():
+        for X, y in tqdm(dataloader):
+            X = fixed_point_quantize(X, wl, fl).to(device)
+            y = fixed_point_quantize(y, wl, fl).to(device)
+            y_hat = model(X.float())
+            accuracy += (y_hat.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
+            ser += (y_hat.argmax(1) != y.argmax(1)).type(torch.float).sum().item()
+    accuracy /= (size*64)
+    ser /= (size*64)
+
+    return ser

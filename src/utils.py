@@ -11,6 +11,7 @@ import torch
 import numpy as np
 from math import floor
 from tqdm import tqdm
+from qtorch.quant import fixed_point_quantize
 from .vector_quatizer import mpgbp
 
 
@@ -100,7 +101,43 @@ def quantize_coefficients(state_dict: dict, MN_ratio: float, device: str):
     quantized_state_dict = {}
     print(f'Quantizing for {MN_ratio}...')
     for key, value in tqdm(state_dict.items()):
-        if len(value.shape) == 2:
+        name = key.split('.')[1]
+        if name == 'bias':
+            quantized_state_dict[key] = value
+        elif len(value.shape) == 2:
+            N = value.shape[1]
+            M_max = int(MN_ratio*N)
+            tensor = torch.zeros(value.shape)
+            for idx in range(value.shape[0]):
+                tensor[idx, :] = mpgbp(value[idx, :], M_max, floor(N**.5), device)
+            quantized_state_dict[key] = tensor
+        else:
+            N = len(value)
+            M_max = int(MN_ratio*N)
+            quantized_state_dict[key] = mpgbp(value, M_max, floor(N**.5), device)
+    
+    return quantized_state_dict
+
+
+def quantize_coefficients2(state_dict: dict, MN_ratio: float, wl:int, fl: int,
+                           device: str):
+    """Method to quatize NN coefficients.
+    
+    Args
+    ----
+    state_dict : dict
+        neural network state dictionary containing trained coefficients
+    MN_ratio : float
+        ratio between vector length and number of SPT terms
+    """
+
+    quantized_state_dict = {}
+    print(f'Quantizing for {MN_ratio}...')
+    for key, value in tqdm(state_dict.items()):
+        name = key.split('.')[1]
+        if name == 'bias':
+            quantized_state_dict[key] = fixed_point_quantize(value, wl, fl)
+        elif len(value.shape) == 2:
             N = value.shape[1]
             M_max = int(MN_ratio*N)
             tensor = torch.zeros(value.shape)
