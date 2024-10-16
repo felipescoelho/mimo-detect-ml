@@ -14,8 +14,8 @@ from math import log2
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from qtorch.quant import fixed_point_quantize
-from .qam import qammod
-from .utils import onehot_map, awgn, keep_quatized
+from .qam import qammod, qamdemod
+from .utils import onehot_map, awgn, onehot_demap, decide
 
 
 class DatasetQAM(Dataset):
@@ -42,6 +42,7 @@ class DatasetQAM(Dataset):
 
         super().__init__()
         self.rng = np.random.default_rng(seed)
+        self.mod_size = mod_size
         if os.path.isfile(dataset_path):
             self.X, self.Y, self.labels, self.onehot_map = torch.load(dataset_path)
         else:
@@ -197,18 +198,51 @@ def test_model(dataloader: DataLoader, model: torch.nn.Module,
 
 def run_model(dataloader: DataLoader, model: torch.nn.Module, device):
     """Method to run model using pytorch"""
-    size = len(dataloader.dataset)
-    accuracy = 0
+    # size = len(dataloader.dataset)
+    # accuracy = 0
     ser = 0
     model.eval()
+    onehotmap = dataloader.dataset.onehot_map
     with torch.no_grad():
         for X, y in tqdm(dataloader):
             X, y = X.to(device), y.to(device)
+            # import pdb; pdb.set_trace()
             y_hat = model(X.float())
-            accuracy += (y_hat.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
-            ser += (y_hat.argmax(1) != y.argmax(1)).type(torch.float).sum().item()
-    accuracy /= (size*64)
-    ser /= (size*64)
+            # accuracy += (y_hat.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
+            Y_pred = onehot_demap(y_hat, onehotmap)
+            Y_true = onehot_demap(y, onehotmap)
+            # import pdb; pdb.set_trace()
+            ser += (Y_pred != Y_true).mean().item()
+            # for it in range(batch_size):
+            #     bits_pred = qamdemod(Y_pred[it, :], 16).flatten()
+            #     bits_true = qamdemod(Y_true[it, :], 16).flatten()
+            #     ber += np.mean(np.abs(bits_pred - bits_true))
+            # ser += (y_hat.argmax(1) != y.argmax(1)).type(torch.float).sum().item()
+    # accuracy /= (size*64)
+    ser /= len(dataloader)
+    print(ser)
+
+    return ser
+
+
+def run_model_zf(dataloader: DataLoader, H: np.ndarray, device):
+    """Method to run model using pytorch"""
+    # size = len(dataloader.dataset)
+    # accuracy = 0
+    ser = 0
+    H = torch.from_numpy(H).to(device)
+    H_inv = torch.linalg.inv(torch.conj(H).T@H)
+    onehotmap = dataloader.dataset.onehot_map
+    for X, y in tqdm(dataloader.dataset):
+        X, y = X.to(device), y.to(device)
+        X_complex = X[:H.shape[0]] + 1j*X[H.shape[0]:]
+        y_hat = H_inv @ torch.conj(H).T @ X_complex
+        y_pred = decide(y_hat, dataloader.dataset.mod_size)
+        y_true = torch.from_numpy(onehot_demap(y, onehotmap)).to(device)
+        # import pdb;pdb.set_trace()
+        ser += (y_pred != y_true).sum().item()/len(y_true)
+    ser /= len(dataloader.dataset)
+    print(ser)
 
     return ser
 

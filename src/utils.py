@@ -11,7 +11,6 @@ import torch
 import numpy as np
 from math import floor
 from tqdm import tqdm
-from qtorch.quant import fixed_point_quantize
 from .vector_quatizer import mpgbp
 
 
@@ -38,6 +37,52 @@ def onehot_map(x: np.ndarray):
     return out, unique_values
 
 
+def onehot_demap(x: torch.Tensor, onehotmap: np.ndarray):
+    """Metho to demap the onehot encoding"""
+
+    xx = x.argmax(1)
+    if len(xx.shape) == 2:  # data in batch
+        batch_size, data_len = xx.shape
+        X = np.zeros((batch_size, int(data_len/2)), dtype=np.complex128)
+        for idx0 in range(batch_size):
+            for idx1 in range(int(data_len/2)):
+                X[idx0, idx1] = onehotmap[xx[idx0, idx1]] \
+                    + 1j*onehotmap[xx[idx0, idx1+int(data_len/2)]]
+    else:
+        xx = x.argmax(0)
+        data_len = len(xx)
+        # import pdb; pdb.set_trace()
+        X = np.zeros((int(data_len/2),), dtype=np.complex128)
+        for idx in range(int(data_len/2)):
+            X[idx] = onehotmap[xx[idx]] + 1j*onehotmap[xx[idx+int(data_len/2)]]
+
+    return X
+
+
+def decide(x: torch.Tensor, mod_size: int):
+    """Method to decide which symbols are in x.
+    
+    Args
+    ----
+    x : torch.Tensor
+        input vector
+    mod_size : int
+        modulation size
+    """
+
+    match mod_size:
+        case 16:
+            symbols = torch.tensor((-3-1j*3, -3-1j, -3+1j, -3+1j*3, -1-1j*3,
+                                    -1-1j, -1+1j, -1+1j*3, 1-1j*3, 1-1j, 1+1j,
+                                    1+1j*3, 3-1j*3, 3-1j, 3+1j, 3+1j*3),
+                                    device=x.device)
+            eggs = symbols.tile(len(x), 1)
+            spam = x.tile(16, 1)
+            sausage = torch.abs(spam.T - eggs).argmin(1)
+            
+            return symbols[sausage]
+
+
 def awgn(x: np.ndarray, snr_dB: float, seed: int | None = None):
     """Method to add white Gaussian noise to a signal.
     
@@ -52,7 +97,7 @@ def awgn(x: np.ndarray, snr_dB: float, seed: int | None = None):
     """
 
     rng = np.random.default_rng(seed)
-    n = rng.standard_normal((len(x),)) + 1j* rng.standard_normal((len(x),))
+    n = rng.standard_normal((len(x),)) + 1j*rng.standard_normal((len(x),))
     n *= np.sqrt(((np.vdot(x, x)/len(x))*10**(-.1*snr_dB))
                  / (np.vdot(n, n)/len(n)))
     
@@ -87,8 +132,9 @@ def matrix_55_toeplitz(N: int, K: int, seed: int | None = None):
     return H
 
 
-def quantize_coefficients(state_dict: dict, MN_ratio: float, device: str):
-    """Method to quatize NN coefficients.
+def quantize_coefficients_mpgbp(state_dict: dict, MN_ratio: float,
+                                device: str):
+    """Method to quatize NN coefficients using the mpgbp algorithm.
     
     Args
     ----
@@ -99,7 +145,7 @@ def quantize_coefficients(state_dict: dict, MN_ratio: float, device: str):
     """
 
     quantized_state_dict = {}
-    print(f'Quantizing for {MN_ratio}...')
+    print(f'Quantizing for M_max/L = {int(MN_ratio)} ...')
     for key, value in tqdm(state_dict.items()):
         name = key.split('.')[1]
         if name == 'bias':
@@ -107,21 +153,26 @@ def quantize_coefficients(state_dict: dict, MN_ratio: float, device: str):
         elif len(value.shape) == 2:
             N = value.shape[1]
             M_max = int(MN_ratio*N)
-            tensor = torch.zeros(value.shape)
+            tensor = torch.zeros(value.shape, device=device)
             for idx in range(value.shape[0]):
-                tensor[idx, :] = mpgbp(value[idx, :], M_max, floor(N**.5), device)
+                normalizer = 2**torch.ceil(
+                    torch.log2(value[idx, :].abs().max())
+                ).item()
+                tensor[idx, :] = mpgbp(value[idx, :]/normalizer, M_max,
+                                       floor(N**.5), device)*normalizer
             quantized_state_dict[key] = tensor
         else:
             N = len(value)
             M_max = int(MN_ratio*N)
-            quantized_state_dict[key] = mpgbp(value, M_max, floor(N**.5), device)
+            normalizer = 2**torch.ceil(torch.log2(value.abs().max())).item()
+            quantized_state_dict[key] = mpgbp(value/normalizer, M_max,
+                                              floor(N**.5), device)*normalizer
     
     return quantized_state_dict
 
 
-def quantize_coefficients2(state_dict: dict, MN_ratio: float, wl:int, fl: int,
-                           device: str):
-    """Method to quatize NN coefficients.
+def quantize_coefficients_naive_mpgbp(state_dict: dict, wl:int, device: str):
+    """Method to quatize NN coefficients using a naïve algorithm
     
     Args
     ----
@@ -131,25 +182,111 @@ def quantize_coefficients2(state_dict: dict, MN_ratio: float, wl:int, fl: int,
         ratio between vector length and number of SPT terms
     """
 
-    quantized_state_dict = {}
-    print(f'Quantizing for {MN_ratio}...')
+    quantized_state_dict_naive = {}
+    quantized_state_dict_mpgbp = {}
+    print(f'Quantizing ...')
     for key, value in tqdm(state_dict.items()):
         name = key.split('.')[1]
         if name == 'bias':
-            quantized_state_dict[key] = fixed_point_quantize(value, wl, fl)
+            quantized_state_dict_naive[key] = value
+            quantized_state_dict_mpgbp[key] = value
         elif len(value.shape) == 2:
-            N = value.shape[1]
-            M_max = int(MN_ratio*N)
-            tensor = torch.zeros(value.shape)
-            for idx in range(value.shape[0]):
-                tensor[idx, :] = mpgbp(value[idx, :], M_max, floor(N**.5), device)
-            quantized_state_dict[key] = tensor
+            tensor_naive = torch.zeros(value.shape, device=device)
+            tensor_mpgbp = torch.zeros(value.shape, device=device)
+            L = value.shape[1]
+            for idx0 in range(value.shape[0]):
+                M_max = 0
+                for idx1 in range(L):
+                    normalizer = 2**torch.ceil(
+                        torch.log2(value[idx0, idx1].abs().max())
+                    ).item()
+                    approx, num_spt = twos_complement(
+                        value[idx0, idx1].item()/normalizer, wl, device
+                    )
+                    tensor_naive[idx0, idx1] = normalizer*approx
+                    M_max += num_spt
+                normalizer = 2**torch.ceil(
+                    torch.log2(value[idx0, :].abs().max())
+                ).item()
+                tensor_mpgbp[idx0, :] = mpgbp(value[idx0, :]/normalizer, M_max,
+                                              floor(L**.5), device)*normalizer
+            quantized_state_dict_naive[key] = tensor_naive
         else:
-            N = len(value)
-            M_max = int(MN_ratio*N)
-            quantized_state_dict[key] = mpgbp(value, M_max, floor(N**.5), device)
+            L = len(value)
+            M_max = 0
+            tensor_naive = torch.zeros((L,), device=device)
+            for idx in range(L):
+                normalizer = 2**torch.ceil(
+                    torch.log2(value[idx].abs().max())
+                ).item()
+                approx, num_spt = twos_complement(value[idx].item()/normalizer,
+                                                  wl, device)
+                tensor_naive[idx] = approx*normalizer
+                M_max += num_spt
+            quantized_state_dict_naive[key] = tensor_naive
+            normalizer = 2**torch.ceil(torch.log2(value.abs().max())).item()
+            quantized_state_dict_mpgbp[key] = mpgbp(value/normalizer, M_max,
+                                                    floor(L**.5),
+                                                    device)*normalizer
     
-    return quantized_state_dict
+    return quantized_state_dict_naive, quantized_state_dict_mpgbp
+
+
+def twos_complement(x: float, wl: int, device: str):
+    """Method to perform the twos complement representation.
+    
+    Args
+    ----
+    x : float
+        input value (normalized by a power of two)
+    wl : int
+        wordlength (number of bits, considering the sign bit)
+    device : str
+        where the tensor is
+    """
+
+    x_2c = torch.zeros((wl), dtype=torch.int, device=device)
+    if x < 0:
+        x_2c[0] = 1
+    residue = abs(x)
+    approx = 0
+    for it in range(1, wl):
+        spam = 2**(-it)
+        if residue - spam > 0:
+            x_2c[it] = 1
+            residue -= spam
+            approx += spam
+    _, spt_count = csd_representation(x_2c, device)
+
+    return approx, spt_count
+
+
+def csd_representation(x: torch.Tensor, device: str):
+    """
+    Method to count the number of SPT terms in the SPT from the 2's
+    complement number representation.
+    
+    Args
+    ----
+    x : torch.Tensor
+        input vector, number represented in 2's complement
+    device : str
+        where is the tensor
+    """
+
+    n = len(x)-1
+    delta = False
+    x_in = torch.hstack((x[1:], torch.tensor(False, device=device)))
+    x_csd = torch.zeros((n+1,), device=device)
+    for i in range(n, -1, -1):
+        theta = torch.logical_and(x_in[i], x_in[i+1])
+        delta = torch.logical_xor(torch.logical_not(delta), theta)
+        if i == 0:
+            x_csd[0] = (1 - 2*x[0])*delta
+
+            return x_csd, x_csd.sum().item()
+        
+        x_csd[i] = (1 - 2*x_in[i-1])*delta
 
 
 def keep_quatized(x: torch.Tensor, MN_ratio: float, device='cuda'):

@@ -16,9 +16,9 @@ from qtorch.quant import fixed_point_quantize
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from src.model import (DatasetQAM, MLP, MLPQuantized, train_model, test_model,
-                       run_model)
-from src.utils import (matrix_55_toeplitz, quantize_coefficients,
-                       quantize_coefficients2)
+                       run_model, run_model_zf)
+from src.utils import (matrix_55_toeplitz, quantize_coefficients_mpgbp,
+                       quantize_coefficients_naive_mpgbp)
 
 
 plt.rcParams.update({
@@ -59,6 +59,7 @@ if __name__ == '__main__':
     dataset_folder = 'datasets'
     model_folder = 'models'
     figures_folder = 'figures'
+    results_folder = 'results'
     golden_ratio = .5*(1+5**.5)
     width = 3.5
     height = width/golden_ratio
@@ -68,6 +69,8 @@ if __name__ == '__main__':
         os.makedirs(model_folder)
     if not os.path.isdir(figures_folder):
         os.makedirs(figures_folder)
+    if not os.path.isdir(results_folder):
+        os.makedirs(results_folder)
     device = ('cuda' if torch.cuda.is_available() else
               'mps' if torch.backends.mps.is_available() else
               'cpu')
@@ -144,6 +147,7 @@ if __name__ == '__main__':
             model.load_state_dict(state_dict)
             snr_values = np.arange(*snr_limits, 1)
             MN_ratio_values = np.array((1., 8, 16.))
+            ser_zf = np.zeros((len(snr_values),))
             ser = np.zeros((len(MN_ratio_values)+1, len(snr_values)))
             print('Load Datasets ...')
             dataset_list = [
@@ -158,37 +162,66 @@ if __name__ == '__main__':
             for idx_MN, MN_ratio in np.ndenumerate(MN_ratio_values):
                 idx0 = idx_MN[0]
                 quantized_model_path = os.path.join(
-                    model_folder, f'model_weights_{MN_ratio}.pth'
+                    model_folder, f'model_weights_SPT_{int(MN_ratio)}.pth'
                 )
                 model_quatized = MLP(N, K).to(device)
                 if os.path.isfile(quantized_model_path):
                     state_dict_quantized = torch.load(quantized_model_path)
                     model_quatized.load_state_dict(state_dict_quantized)
                 else:
-                    state_dict_quantized = quantize_coefficients(
+                    state_dict_quantized = quantize_coefficients_mpgbp(
                         state_dict, MN_ratio, device
                     )
                     model_quatized.load_state_dict(state_dict_quantized)
                     torch.save(model_quatized.state_dict(),
                                quantized_model_path)
                 for idx_snr, snr_dB in np.ndenumerate(snr_values):
+                    results_path = os.path.join(
+                        results_folder,
+                        f'results_SPT_{int(MN_ratio)}_SNR_{snr_dB}.npy'
+                    )
+                    results_zf_path = os.path.join(
+                        results_folder, f'results_zf_SNR_{snr_dB}.npy'
+                    )
+                    results_fp_path = os.path.join(
+                        results_folder, f'results_fp_SNR_{snr_dB}.npy'
+                    )
                     idx1 = idx_snr[0]
                     dataloader = DataLoader(
                         dataset_list[idx1], batch_size=batch_size, shuffle=True
                     )
                     if idx0 == 0:
-                        print('Run full precision model')
-                        ser[0, idx1] = run_model(dataloader, model, device)
-                    print(f'Run quantized model M/N {MN_ratio} | SNR {snr_dB}')
-                    ser[idx0+1, idx1] = run_model(dataloader, model_quatized,
-                                                  device)
-            
+                        if os.path.isfile(results_zf_path):
+                            ser_zf_idx = np.load(results_zf_path)
+                        else:
+                            print(f'Run Zero forcing model | SNR {snr_dB}')
+                            ser_zf_idx = run_model_zf(dataloader, H, device)
+                            np.save(results_zf_path, ser_zf_idx)
+                        ser_zf[idx1] = ser_zf_idx
+                        if os.path.isfile(results_fp_path):
+                            ser_fp = np.load(results_fp_path)
+                        else:
+                            print(f'Run full precision model | SNR {snr_dB}')
+                            ser_fp = run_model(dataloader, model, device)
+                            np.save(results_fp_path, ser_fp)
+                        ser[0, idx1] = ser_fp
+                    if os.path.isfile(results_path):
+                        ser_idx = np.load(results_path)
+                    else:
+                        print(f'Run quantized model M_max/L {int(MN_ratio)}'
+                              + f'| SNR {snr_dB}')
+                        ser_idx = run_model(dataloader, model_quatized, device)
+                    ser[idx0+1, idx1] = ser_idx
+
+
             fig = plt.figure(figsize=(width, height))
             ax = fig.add_subplot(111)
+            ax.semilogy(snr_values, ser_zf, label='ZF')
             ax.semilogy(snr_values, ser[0, :], label='Full Precision')
             for idx, MN_ratio in np.ndenumerate(MN_ratio_values):
                 ax.semilogy(snr_values, ser[idx[0]+1, :],
-                            label=f'M/L = {int(MN_ratio)}')
+                            label='$M_{\\textrm{max}}/L$ = ' \
+                                + f'{int(MN_ratio)}')
             ax.legend(ncols=1)
             ax.grid()
             ax.set_xlabel('SNR, dB')

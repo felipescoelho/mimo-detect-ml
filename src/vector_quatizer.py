@@ -8,7 +8,6 @@ Sep 25, 2024
 
 
 import torch
-import numpy as np
 
 
 def mpgbp(x: torch.Tensor, M_max: int, P: int, device: str, epsilon=1e-12):
