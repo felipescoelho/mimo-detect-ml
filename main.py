@@ -31,7 +31,8 @@ plt.rcParams.update({
 def arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--mode', default='train', help='Operation mode',
-                        type=str, choices=['train', 'run', 'test', 'run2'])
+                        type=str, choices=['train', 'run', 'test', 'run2',
+                                           'run3'])
     parser.add_argument('--K', type=int, default=32)
     parser.add_argument('--N', type=int, default=64)
     parser.add_argument('--mod_size', type=int, choices=[2, 4, 16], default=16)
@@ -76,12 +77,16 @@ if __name__ == '__main__':
               'cpu')
     match args.mode:
         case 'test':
-            from src.vector_quatizer import mpgbp
-            from math import floor
-            v = torch.randn((N,))
-            v_hat = mpgbp(v, 128, floor(N**.5), (-64, 64))
-            print(v)
-            print(v_hat)
+            from src.utils import twos_complement
+            a = 4.532984
+            normalizer = 2**torch.ceil(torch.log2(torch.tensor(a).abs())).item()
+            print(f'value: {a}')
+            print(f'normalizer: {normalizer}')
+            print(f'normalized value: {a/normalizer}')
+            aa, spt_count = twos_complement(a/normalizer, 8, 'cuda')
+            print(f"SPT approximation: {aa}")
+            print(f'recovered value: {aa*normalizer}')
+            print(f'spt_count: {int(spt_count)}')
         case 'train':
             train_path = os.path.join(dataset_folder, 'train_dataset.pt')
             test_path = os.path.join(dataset_folder, 'test_dataset.pt')
@@ -139,6 +144,7 @@ if __name__ == '__main__':
             fig.savefig(os.path.join(figures_folder, 'train_loss.png'),
                         format='png', bbox_inches='tight')
         case 'run':
+            # Experiment Quantization:
             channel_path = os.path.join(dataset_folder, 'channel_matrix.npy')
             model_path = os.path.join(model_folder, 'model_weights.pth')
             H = np.load(channel_path)
@@ -152,7 +158,7 @@ if __name__ == '__main__':
             print('Load Datasets ...')
             dataset_list = [
                 DatasetQAM(K, N, mod_size, args.n_run, H,
-                           np.array((snr_values[idx])),
+                           np.array((snr_values[idx],)),
                            dataset_path=os.path.join(
                                dataset_folder,
                                f'run_SNR_{snr_values[idx]}.pt'
@@ -211,12 +217,13 @@ if __name__ == '__main__':
                         print(f'Run quantized model M_max/L {int(MN_ratio)}'
                               + f'| SNR {snr_dB}')
                         ser_idx = run_model(dataloader, model_quatized, device)
+                        np.save(results_path, ser_idx)
                     ser[idx0+1, idx1] = ser_idx
-
 
             fig = plt.figure(figsize=(width, height))
             ax = fig.add_subplot(111)
-            ax.semilogy(snr_values, ser_zf, label='ZF')
+            ax.semilogy(snr_values, ser_zf,
+                        label='$\\textrm{ZF}_{\\textrm{genie}}$')
             ax.semilogy(snr_values, ser[0, :], label='Full Precision')
             for idx, MN_ratio in np.ndenumerate(MN_ratio_values):
                 ax.semilogy(snr_values, ser[idx[0]+1, :],
@@ -233,70 +240,96 @@ if __name__ == '__main__':
             fig.savefig(os.path.join(figures_folder, 'ser.png'),
                         format='png', bbox_inches='tight')
         case 'run2':
+            # Compare with naive method
             wl = 8
-            fl = 5
             channel_path = os.path.join(dataset_folder, 'channel_matrix.npy')
             model_path = os.path.join(model_folder, 'model_weights.pth')
             H = np.load(channel_path)
             state_dict = torch.load(model_path)
-            for key, values in state_dict.items():
-                state_dict[key] = fixed_point_quantize(values, wl, fl)
-            model = MLPQuantized(N, K, wl, fl).to(device)
-            model.load_state_dict(state_dict)
+            model_naive = MLP(N, K).to(device)
+            model_mpgbp = MLP(N, K).to(device)
+            state_dict_naive, state_dict_mpgbp = \
+                quantize_coefficients_naive_mpgbp(state_dict, wl, device)
+            model_naive.load_state_dict(state_dict_naive)
+            model_mpgbp.load_state_dict(state_dict_mpgbp)
             snr_values = np.arange(*snr_limits, 1)
-            MN_ratio_values = np.array((1., 8, 16.))
-            ser = np.zeros((len(MN_ratio_values)+1, len(snr_values)))
+            ser = np.zeros((2, len(snr_values)))
             print('Load Datasets ...')
             dataset_list = [
                 DatasetQAM(K, N, mod_size, args.n_run, H,
-                           np.array((snr_values[idx])),
+                           np.array((snr_values[idx],)),
                            dataset_path=os.path.join(
                                dataset_folder,
                                f'run_SNR_{snr_values[idx]}.pt'
                            )) for idx in tqdm(range(len(snr_values)))
             ]
             print('Done!')
-            for idx_MN, MN_ratio in np.ndenumerate(MN_ratio_values):
-                idx0 = idx_MN[0]
-                quantized_model_path = os.path.join(
-                    model_folder, f'model_weights2_SPT_{int(MN_ratio)}.pth'
-                )
-                model_quatized = MLPQuantized(N, K, wl, fl).to(device)
-                if os.path.isfile(quantized_model_path):
-                    state_dict_quantized = torch.load(quantized_model_path)
-                    model_quatized.load_state_dict(state_dict_quantized)
-                else:
-                    state_dict_quantized = quantize_coefficients2(
-                        state_dict, MN_ratio, wl, fl, device
-                    )
-                    model_quatized.load_state_dict(state_dict_quantized)
-                    torch.save(model_quatized.state_dict(),
-                               quantized_model_path)
-                for idx_snr, snr_dB in np.ndenumerate(snr_values):
-                    idx1 = idx_snr[0]
-                    dataloader = DataLoader(
-                        dataset_list[idx1], batch_size=batch_size, shuffle=True
-                    )
-                    if idx0 == 0:
-                        print('Run full precision model')
-                        ser[0, idx1] = run_model(dataloader, model, device)
-                    print(f'Run quantized model M/N {MN_ratio} | SNR {snr_dB}')
-                    ser[idx0+1, idx1] = run_model(dataloader, model_quatized,
-                                                  device)
+            for idx_snr, snr_dB in np.ndenumerate(snr_values):
+                idx0 = idx_snr[0]
+                dataloader = DataLoader(dataset_list[idx0],
+                                        batch_size=batch_size, shuffle=True)
+                print(f'Run MPGBP model SNR {snr_dB}.')
+                ser[0, idx0] = run_model(dataloader, model_mpgbp, device)
+                print(f'Run naive model SNR {snr_dB}.')
+                ser[1, idx0] = run_model(dataloader, model_naive, device)
             
             fig = plt.figure(figsize=(width, height))
             ax = fig.add_subplot(111)
-            ax.semilogy(snr_values, ser[0, :], label='Full Precision')
-            for idx, MN_ratio in np.ndenumerate(MN_ratio_values):
-                ax.semilogy(snr_values, ser[idx[0]+1, :],
-                            label=f'M/L = {int(MN_ratio)}')
+            ax.semilogy(snr_values, ser[0, :], label='MPGBP')
+            ax.semilogy(snr_values, ser[1, :], label='Naive')
             ax.legend(ncols=1)
             ax.grid()
             ax.set_xlabel('SNR, dB')
             ax.set_ylabel('SER')
             fig.tight_layout()
 
-            fig.savefig(os.path.join(figures_folder, 'ser.eps'),
+            fig.savefig(os.path.join(figures_folder, 'ser2.eps'),
                         format='eps', bbox_inches='tight')
-            fig.savefig(os.path.join(figures_folder, 'ser.png'),
+            fig.savefig(os.path.join(figures_folder, 'ser2.png'),
                         format='png', bbox_inches='tight')
+        case 'run3':
+            # Layer sensibility test
+            channel_path = os.path.join(dataset_folder, 'channel_matrix.npy')
+            model_path = os.path.join(model_folder, 'model_weights.pth')
+            model_quantized_path = os.path.join(model_folder,
+                                                'model_weights.pth')
+            H = np.load(channel_path)
+            state_dict = torch.load(model_path)
+            state_dict_quantized = torch.load(model_quantized_path)
+            model_list = []
+            layer_list = []
+            for layer_name in set([key.split('.')[0] for key in state_dict.keys()]):
+                key_list = [key for key in state_dict.keys() if
+                            key.startswith(layer_name)]
+                spam = state_dict.copy()
+                for key in key_list:
+                    spam[key] = state_dict_quantized[key]
+                model = MLP(N, K)
+                model.load_state_dict(spam)
+                model_list.append(model)
+                layer_list.append(layer_name)
+            sorting_index = sorted(range(len(layer_list)),
+                                   key=layer_list.__getitem__)
+            snr_values = np.arange(*snr_limits, 1)
+            print('Load Datasets ...')
+            dataset_list = [
+                DatasetQAM(K, N, mod_size, args.n_run, H,
+                           np.array((snr_values[idx],)),
+                           dataset_path=os.path.join(
+                               dataset_folder,
+                               f'run_SNR_{snr_values[idx]}.pt'
+                           )) for idx in tqdm(range(len(snr_values)))
+            ]
+            print('Done!')
+            ser = np.zeros((len(layer_list), len(snr_values)))
+            for idx_snr, snr_dB in np.ndenumerate(snr_values):
+                idx0 = idx_snr[0]
+                dataloader = DataLoader(dataset_list[idx0],
+                                        batch_size=batch_size, shuffle=True)
+                for idx1, model in enumerate(model_list):
+                    layer_num = sorting_index[idx1]+1
+                    print(f'Run model quantized layer {layer_num}')
+                    ser[layer_num-1, idx0] = run_model(dataloader, model,
+                                                       device)
+                    
+                    

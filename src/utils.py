@@ -51,7 +51,6 @@ def onehot_demap(x: torch.Tensor, onehotmap: np.ndarray):
     else:
         xx = x.argmax(0)
         data_len = len(xx)
-        # import pdb; pdb.set_trace()
         X = np.zeros((int(data_len/2),), dtype=np.complex128)
         for idx in range(int(data_len/2)):
             X[idx] = onehotmap[xx[idx]] + 1j*onehotmap[xx[idx+int(data_len/2)]]
@@ -83,13 +82,15 @@ def decide(x: torch.Tensor, mod_size: int):
             return symbols[sausage]
 
 
-def awgn(x: np.ndarray, snr_dB: float, seed: int | None = None):
+def awgn(x: np.ndarray, P_in: float, snr_dB: float, seed: int | None = None):
     """Method to add white Gaussian noise to a signal.
     
     Args
     ----
     x : np.ndarray
         input array
+    P_in : float
+        reference signal power
     snr_dB : float
         signal to noise ratio in dB
     seed : int | None (default=None)
@@ -98,8 +99,8 @@ def awgn(x: np.ndarray, snr_dB: float, seed: int | None = None):
 
     rng = np.random.default_rng(seed)
     n = rng.standard_normal((len(x),)) + 1j*rng.standard_normal((len(x),))
-    n *= np.sqrt(((np.vdot(x, x)/len(x))*10**(-.1*snr_dB))
-                 / (np.vdot(n, n)/len(n)))
+    sigma2_n = P_in * 10**(-.1*snr_dB)
+    n *= np.sqrt(sigma2_n/2)
     
     return x + n
 
@@ -233,8 +234,11 @@ def quantize_coefficients_naive_mpgbp(state_dict: dict, wl:int, device: str):
 
 
 def twos_complement(x: float, wl: int, device: str):
-    """Method to perform the twos complement representation.
+    """Method to perform the two's complement representation and count
+    number of SPT's necessary for computation.
     
+    This is dog's math ...
+
     Args
     ----
     x : float
@@ -245,20 +249,30 @@ def twos_complement(x: float, wl: int, device: str):
         where the tensor is
     """
 
-    x_2c = torch.zeros((wl), dtype=torch.int, device=device)
-    if x < 0:
-        x_2c[0] = 1
-    residue = abs(x)
-    approx = 0
+    x_2c = torch.zeros((wl,), device=device)
+    spam = abs(x)
     for it in range(1, wl):
-        spam = 2**(-it)
-        if residue - spam > 0:
+        spam *= 2
+        if spam >= 1:
             x_2c[it] = 1
-            residue -= spam
-            approx += spam
-    _, spt_count = csd_representation(x_2c, device)
+            spam -= 1
+    if x < 0:
+        x_2c = torch.logical_not(x_2c).type(torch.float)  # 1's complement
+        x_2c[-1] += 1  # Add 1 to LSB to become 2's complement
+        for bit in range(wl-2, 1, -1):
+            if x_2c[bit+1] == 2:  # Propagate value
+                x_2c[bit] -= 1
+                x_2c[bit+1] = 0
+            else:
+                break
+        if x_2c[1] == 2:
+            print('Overflow! Why?')
+            x_2c[1] = 0
+    base = torch.tensor([2**-bit for bit in range(wl)], device=device).float()
+    base[0] = -1
+    approx_spt, spt_count = csd_representation(x_2c, device)
 
-    return approx, spt_count
+    return approx_spt, spt_count
 
 
 def csd_representation(x: torch.Tensor, device: str):
@@ -266,6 +280,8 @@ def csd_representation(x: torch.Tensor, device: str):
     Method to count the number of SPT terms in the SPT from the 2's
     complement number representation.
     
+    This is still dog's math, but it's Border Collie level ...
+
     Args
     ----
     x : torch.Tensor
@@ -275,16 +291,18 @@ def csd_representation(x: torch.Tensor, device: str):
     """
 
     n = len(x)-1
-    delta = False
-    x_in = torch.hstack((x[1:], torch.tensor(False, device=device)))
+    base = torch.tensor([2**-bit for bit in range(n+1)], device=device).float()
+    delta = torch.tensor(False, device=device)
+    x_in = torch.hstack((x, torch.tensor(False, device=device)))
     x_csd = torch.zeros((n+1,), device=device)
     for i in range(n, -1, -1):
-        theta = torch.logical_and(x_in[i], x_in[i+1])
-        delta = torch.logical_xor(torch.logical_not(delta), theta)
+        theta = torch.logical_xor(x_in[i], x_in[i+1])
+        delta = torch.logical_and(torch.logical_not(delta), theta)
         if i == 0:
             x_csd[0] = (1 - 2*x[0])*delta
+            approx = torch.dot(base, x_csd)
 
-            return x_csd, x_csd.sum().item()
+            return approx, x_csd.abs().sum().item()
         
         x_csd[i] = (1 - 2*x_in[i-1])*delta
 

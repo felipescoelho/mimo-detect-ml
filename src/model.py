@@ -53,16 +53,13 @@ class DatasetQAM(Dataset):
             x = np.zeros((ensemble, int(2*K)))
             y = np.zeros((ensemble, int(2*N)))
             print('Allocate data to save:')
+            P_in = 10 * K/N  # because of the 16-QAM
             for idx in tqdm(range(ensemble)):
-                noisy_symbols = awgn(symbols[idx, :], self.rng.choice(snr_dB))
-                received = H @ noisy_symbols
+                received = awgn(H @ symbols[idx, :], P_in, self.rng.choice(snr_dB))
                 y[idx, :] = np.hstack((received.real, received.imag))
-                # for the reference:
                 x[idx, :] = np.hstack((symbols[idx, :].real,
                                        symbols[idx, :].imag))
             x_onehot, self.onehot_map = onehot_map(x)
-            
-            # import pdb; pdb.set_trace()
             self.X = torch.from_numpy(x)
             self.Y = torch.from_numpy(y)
             self.labels = torch.from_numpy(x_onehot)
