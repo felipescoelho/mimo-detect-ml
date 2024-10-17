@@ -10,9 +10,10 @@ Out 7, 2024
 import os
 import argparse
 import torch
-import numpy as np
+import math
 import matplotlib.pyplot as plt
-from qtorch.quant import fixed_point_quantize
+import numpy as np
+from matplotlib.collections import PolyCollection
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from src.model import (DatasetQAM, MLP, MLPQuantized, train_model, test_model,
@@ -40,11 +41,21 @@ def arg_parser():
     parser.add_argument('--learning_rate', type=float, default=1e-3)
     parser.add_argument('--batch_size', type=int, default=1000)
     parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--n_run', type=int, default=250000)
+    parser.add_argument('--n_run', type=int, default=1000)
     parser.add_argument('--snr_limits', type=str, default='7,14')
     parser.add_argument('--seed', type=int, default=None, help='Seed for RNG')
 
     return parser.parse_args()
+
+
+def polygon_under_graph(x, y):
+    """
+    Construct the vertex list which defines the polygon filling the
+    space under the (x, y) line graph. This assumes x is in ascending
+    order.
+    """
+
+    return [(x[0], 0.), *zip(x, y), (x[-1], 0.)]
 
 
 if __name__ == '__main__':
@@ -78,15 +89,48 @@ if __name__ == '__main__':
     match args.mode:
         case 'test':
             from src.utils import twos_complement
-            a = 4.532984
-            normalizer = 2**torch.ceil(torch.log2(torch.tensor(a).abs())).item()
-            print(f'value: {a}')
-            print(f'normalizer: {normalizer}')
-            print(f'normalized value: {a/normalizer}')
-            aa, spt_count = twos_complement(a/normalizer, 8, 'cuda')
-            print(f"SPT approximation: {aa}")
-            print(f'recovered value: {aa*normalizer}')
-            print(f'spt_count: {int(spt_count)}')
+            from src.vector_quatizer import mpgbp
+            from math import sqrt, floor
+            L = 16
+            mse_mpgbp_list = []
+            mse_naive_list = []
+            min_wl, max_wl = 2, 33
+            ensemble = 100
+            for wl in tqdm(range(min_wl, max_wl)):
+                mse_mpgbp = []
+                mse_naive = []
+                for it in range(ensemble):
+                    a = torch.randn((L,), device='cuda')
+                    approx_naive = torch.zeros((L,), device='cuda')
+                    spt_total = 0
+                    for idx in range(L):
+                        normalizer = 2**torch.ceil(
+                            torch.log2(a[idx].abs())
+                        ).item()
+                        approx, spt_count = twos_complement(
+                            a[idx].item()/normalizer, wl, 'cuda'
+                        )
+                        spt_total += spt_count
+                        approx_naive[idx] = approx*normalizer
+                    normalizer = 2**torch.ceil(
+                        torch.log2(a.abs().max())
+                    ).item()
+                    approx_mpgbp = mpgbp(
+                        a/normalizer, spt_total, floor(sqrt(L)), 'cuda'
+                    )*normalizer
+                    mse_mpgbp.append(torch.norm(a-approx_mpgbp, p=2).item()/L)
+                    mse_naive.append(torch.norm(a-approx_naive, p=2).item()/L)
+                mse_mpgbp_list.append(sum(mse_mpgbp)/ensemble)
+                mse_naive_list.append(sum(mse_naive)/ensemble)
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            ax.plot(range(min_wl, max_wl), mse_mpgbp_list, label='mpgbp')
+            ax.plot(range(min_wl, max_wl), mse_naive_list, label='naive')
+            ax.set_xlabel('wordlength')
+            ax.set_ylabel('MSE')
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(figures_folder, 'mse.png'))
         case 'train':
             train_path = os.path.join(dataset_folder, 'train_dataset.pt')
             test_path = os.path.join(dataset_folder, 'test_dataset.pt')
@@ -306,6 +350,7 @@ if __name__ == '__main__':
                     spam[key] = state_dict_quantized[key]
                 model = MLP(N, K)
                 model.load_state_dict(spam)
+                model.to(device)
                 model_list.append(model)
                 layer_list.append(layer_name)
             sorting_index = sorted(range(len(layer_list)),
@@ -331,5 +376,24 @@ if __name__ == '__main__':
                     print(f'Run model quantized layer {layer_num}')
                     ser[layer_num-1, idx0] = run_model(dataloader, model,
                                                        device)
+            
+            fig = plt.figure(figsize=(width, height))
+            ax = fig.add_subplot(projection='3d')
+            # verts[i] is a list of (x, y) pairs defining polygon i.
+            verts = [polygon_under_graph(
+                snr_values, ser[l, :])
+                for l in range(len(layer_list))
+            ]
+            facecolors = plt.colormaps['viridis_r'](np.linspace(0, 1,
+                                                                len(verts)))
+            poly = PolyCollection(verts, facecolors=facecolors, alpha=.7)
+            ax.add_collection3d(poly, zs=range(1, len(layer_list)+1),
+                                zdir='y')
+            ax.set_zlabel('log')
+            ax.set(xlabel='SNR, dB', ylabel='Layer', zlabel='SER')
+            fig.tight_layout()
+            fig_eps_path = os.path.join(figures_folder, 'ser_run3.eps')
+            fig_png_path = os.path.join(figures_folder, 'ser_run3.png')
+            fig.savefig(fig_eps_path, format='eps', bbox_inches='tight')
                     
                     

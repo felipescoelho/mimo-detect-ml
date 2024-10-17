@@ -199,7 +199,7 @@ def quantize_coefficients_naive_mpgbp(state_dict: dict, wl:int, device: str):
                 M_max = 0
                 for idx1 in range(L):
                     normalizer = 2**torch.ceil(
-                        torch.log2(value[idx0, idx1].abs().max())
+                        torch.log2(value[idx0, idx1].abs())
                     ).item()
                     approx, num_spt = twos_complement(
                         value[idx0, idx1].item()/normalizer, wl, device
@@ -212,6 +212,7 @@ def quantize_coefficients_naive_mpgbp(state_dict: dict, wl:int, device: str):
                 tensor_mpgbp[idx0, :] = mpgbp(value[idx0, :]/normalizer, M_max,
                                               floor(L**.5), device)*normalizer
             quantized_state_dict_naive[key] = tensor_naive
+            quantized_state_dict_mpgbp[key] = tensor_mpgbp
         else:
             L = len(value)
             M_max = 0
