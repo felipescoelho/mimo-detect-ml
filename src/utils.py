@@ -11,7 +11,7 @@ import torch
 import numpy as np
 from math import floor
 from tqdm import tqdm
-from .vector_quatizer import mpgbp
+from .vq import mpgbp
 
 
 def onehot_map(x: np.ndarray):
@@ -159,15 +159,18 @@ def quantize_coefficients_mpgbp(state_dict: dict, MN_ratio: float,
                 normalizer = 2**torch.ceil(
                     torch.log2(value[idx, :].abs().max())
                 ).item()
-                tensor[idx, :] = mpgbp(value[idx, :]/normalizer, M_max,
-                                       floor(N**.5), device)*normalizer
+                tensor[idx, :] = torch.from_numpy(mpgbp(
+                    value[idx, :].detach().cpu().numpy()/normalizer, M_max,
+                    floor(N**.5)
+                )*normalizer).to(device)
             quantized_state_dict[key] = tensor
         else:
             N = len(value)
             M_max = int(MN_ratio*N)
             normalizer = 2**torch.ceil(torch.log2(value.abs().max())).item()
-            quantized_state_dict[key] = mpgbp(value/normalizer, M_max,
-                                              floor(N**.5), device)*normalizer
+            quantized_state_dict[key] = torch.from_numpy(mpgbp(
+                value.detach().cpu().numpy()/normalizer, M_max, floor(N**.5)
+            )*normalizer).to(device)
     
     return quantized_state_dict
 
@@ -195,6 +198,7 @@ def quantize_coefficients_naive_mpgbp(state_dict: dict, wl:int, device: str):
             tensor_naive = torch.zeros(value.shape, device=device)
             tensor_mpgbp = torch.zeros(value.shape, device=device)
             L = value.shape[1]
+            ML = 0
             for idx0 in range(value.shape[0]):
                 M_max = 0
                 for idx1 in range(L):
@@ -209,8 +213,12 @@ def quantize_coefficients_naive_mpgbp(state_dict: dict, wl:int, device: str):
                 normalizer = 2**torch.ceil(
                     torch.log2(value[idx0, :].abs().max())
                 ).item()
-                tensor_mpgbp[idx0, :] = mpgbp(value[idx0, :]/normalizer, M_max,
-                                              floor(L**.5), device)*normalizer
+                tensor_mpgbp[idx0, :] = torch.from_numpy(mpgbp(
+                    value[idx0, :].detach().cpu().numpy()/normalizer, M_max,
+                    floor(L**.5)
+                )*normalizer).to(device)
+                ML += M_max/L
+            print(f'Avg. M/L = {ML/value.shape[0]}')
             quantized_state_dict_naive[key] = tensor_naive
             quantized_state_dict_mpgbp[key] = tensor_mpgbp
         else:
@@ -227,9 +235,10 @@ def quantize_coefficients_naive_mpgbp(state_dict: dict, wl:int, device: str):
                 M_max += num_spt
             quantized_state_dict_naive[key] = tensor_naive
             normalizer = 2**torch.ceil(torch.log2(value.abs().max())).item()
-            quantized_state_dict_mpgbp[key] = mpgbp(value/normalizer, M_max,
-                                                    floor(L**.5),
-                                                    device)*normalizer
+            quantized_state_dict_mpgbp[key] = torch.from_numpy(mpgbp(
+                value.detach().cpu().numpy()/normalizer, M_max, floor(L**.5),
+            )*normalizer).to(device)
+            print(f'M/L = {M_max/L}.')
     
     return quantized_state_dict_naive, quantized_state_dict_mpgbp
 

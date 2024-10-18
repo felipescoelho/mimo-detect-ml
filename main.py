@@ -38,7 +38,7 @@ def arg_parser():
     parser.add_argument('--N', type=int, default=64)
     parser.add_argument('--mod_size', type=int, choices=[2, 4, 16], default=16)
     parser.add_argument('--ensemble', type=int, default=1250000)
-    parser.add_argument('--learning_rate', type=float, default=1e-3)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=int, default=1000)
     parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--n_run', type=int, default=1000)
@@ -89,7 +89,7 @@ if __name__ == '__main__':
     match args.mode:
         case 'test':
             from src.utils import twos_complement
-            from src.vector_quatizer import mpgbp
+            from src.vq import mpgbp
             from math import sqrt, floor
             L = 16
             mse_mpgbp_list = []
@@ -115,9 +115,10 @@ if __name__ == '__main__':
                     normalizer = 2**torch.ceil(
                         torch.log2(a.abs().max())
                     ).item()
-                    approx_mpgbp = mpgbp(
-                        a/normalizer, spt_total, floor(sqrt(L)), 'cuda'
-                    )*normalizer
+                    approx_mpgbp = torch.from_numpy(mpgbp(
+                        a.detach().cpu().numpy()/normalizer, int(spt_total),
+                        floor(sqrt(L))
+                    )*normalizer).to(device)
                     mse_mpgbp.append(torch.norm(a-approx_mpgbp, p=2).item()/L)
                     mse_naive.append(torch.norm(a-approx_naive, p=2).item()/L)
                 mse_mpgbp_list.append(sum(mse_mpgbp)/ensemble)
@@ -135,7 +136,7 @@ if __name__ == '__main__':
             train_path = os.path.join(dataset_folder, 'train_dataset.pt')
             test_path = os.path.join(dataset_folder, 'test_dataset.pt')
             channel_path = os.path.join(dataset_folder, 'channel_matrix.npy')
-            model_path = os.path.join(model_folder, 'model_weights.pth')
+            model_path = os.path.join(model_folder, 'model_weights2.pth')
             train_results_path = os.path.join(model_folder,
                                               'train_results.npz')
             if not os.path.isfile(channel_path):
@@ -196,7 +197,7 @@ if __name__ == '__main__':
             model = MLP(N, K).to(device)
             model.load_state_dict(state_dict)
             snr_values = np.arange(*snr_limits, 1)
-            MN_ratio_values = np.array((1., 8, 16.))
+            MN_ratio_values = np.array((1., 1.5, 2.))
             ser_zf = np.zeros((len(snr_values),))
             ser = np.zeros((len(MN_ratio_values)+1, len(snr_values)))
             print('Load Datasets ...')
@@ -212,7 +213,7 @@ if __name__ == '__main__':
             for idx_MN, MN_ratio in np.ndenumerate(MN_ratio_values):
                 idx0 = idx_MN[0]
                 quantized_model_path = os.path.join(
-                    model_folder, f'model_weights_SPT_{int(MN_ratio)}.pth'
+                    model_folder, f'model_weights_SPT_ratio_{MN_ratio}.pth'
                 )
                 model_quatized = MLP(N, K).to(device)
                 if os.path.isfile(quantized_model_path):
@@ -228,7 +229,7 @@ if __name__ == '__main__':
                 for idx_snr, snr_dB in np.ndenumerate(snr_values):
                     results_path = os.path.join(
                         results_folder,
-                        f'results_SPT_{int(MN_ratio)}_SNR_{snr_dB}.npy'
+                        f'results_SPT_{MN_ratio}_SNR_{snr_dB}.npy'
                     )
                     results_zf_path = os.path.join(
                         results_folder, f'results_zf_SNR_{snr_dB}.npy'
@@ -258,7 +259,7 @@ if __name__ == '__main__':
                     if os.path.isfile(results_path):
                         ser_idx = np.load(results_path)
                     else:
-                        print(f'Run quantized model M_max/L {int(MN_ratio)}'
+                        print(f'Run quantized model M_max/L {MN_ratio}'
                               + f'| SNR {snr_dB}')
                         ser_idx = run_model(dataloader, model_quatized, device)
                         np.save(results_path, ser_idx)
@@ -266,13 +267,15 @@ if __name__ == '__main__':
 
             fig = plt.figure(figsize=(width, height))
             ax = fig.add_subplot(111)
-            ax.semilogy(snr_values, ser_zf,
-                        label='$\\textrm{ZF}_{\\textrm{genie}}$')
-            ax.semilogy(snr_values, ser[0, :], label='Full Precision')
+            ax.semilogy(snr_values, ser_zf, marker='s', label='ZF')
+            ax.semilogy(snr_values, ser[0, :], marker='<',
+                        label='Full Precision')
+            marker_list = ['p', '*', 'X']
             for idx, MN_ratio in np.ndenumerate(MN_ratio_values):
                 ax.semilogy(snr_values, ser[idx[0]+1, :],
-                            label='$M_{\\textrm{max}}/L$ = ' \
-                                + f'{int(MN_ratio)}')
+                            marker=marker_list[idx[0]],
+                            label='$M_{\scriptsize\\textrm{max}}/L$ = ' \
+                                + f'{MN_ratio}')
             ax.legend(ncols=1)
             ax.grid()
             ax.set_xlabel('SNR, dB')
@@ -285,19 +288,21 @@ if __name__ == '__main__':
                         format='png', bbox_inches='tight')
         case 'run2':
             # Compare with naive method
-            wl = 8
+            wl = 6
             channel_path = os.path.join(dataset_folder, 'channel_matrix.npy')
             model_path = os.path.join(model_folder, 'model_weights.pth')
             H = np.load(channel_path)
             state_dict = torch.load(model_path)
+            model_full = MLP(N, K).to(device)
             model_naive = MLP(N, K).to(device)
             model_mpgbp = MLP(N, K).to(device)
             state_dict_naive, state_dict_mpgbp = \
                 quantize_coefficients_naive_mpgbp(state_dict, wl, device)
             model_naive.load_state_dict(state_dict_naive)
             model_mpgbp.load_state_dict(state_dict_mpgbp)
+            model_full.load_state_dict(state_dict)
             snr_values = np.arange(*snr_limits, 1)
-            ser = np.zeros((2, len(snr_values)))
+            ser = np.zeros((3, len(snr_values)))
             print('Load Datasets ...')
             dataset_list = [
                 DatasetQAM(K, N, mod_size, args.n_run, H,
@@ -316,11 +321,14 @@ if __name__ == '__main__':
                 ser[0, idx0] = run_model(dataloader, model_mpgbp, device)
                 print(f'Run naive model SNR {snr_dB}.')
                 ser[1, idx0] = run_model(dataloader, model_naive, device)
+                print(f'Run full precision SNR {snr_dB}.')
+                ser[2, idx0] = run_model(dataloader, model_full, device)
             
             fig = plt.figure(figsize=(width, height))
             ax = fig.add_subplot(111)
-            ax.semilogy(snr_values, ser[0, :], label='MPGBP')
-            ax.semilogy(snr_values, ser[1, :], label='Naive')
+            ax.semilogy(snr_values, ser[2, :], marker='<', label='Full Precision')
+            ax.semilogy(snr_values, ser[0, :], marker='p', label='MPGBP')
+            ax.semilogy(snr_values, ser[1, :], marker='*', label='Naive')
             ax.legend(ncols=1)
             ax.grid()
             ax.set_xlabel('SNR, dB')
