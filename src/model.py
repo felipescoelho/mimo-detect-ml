@@ -7,89 +7,28 @@ Sep 17, 2024
 """
 
 
-import os
 import torch
 import numpy as np
-from math import log2
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from qtorch.quant import fixed_point_quantize
-from .qam import qammod, qamdemod
-from .utils import onehot_map, awgn, onehot_demap, decide
+from .utils import onehot_demap, decide
 
 
-class DatasetQAM(Dataset):
-    def __init__(self, K: int, N: int, mod_size: int, ensemble: int,
-                 H: np.ndarray, snr_dB: np.ndarray, seed: int | None = None,
-                 dataset_path: str | None = None):
-        """Generates the dataset for the autoencoder.
-        
-        Args
-        ----
-        K : int
-            number of symbols
-        N : int
-            number of antennas at the receiver
-        mod_size : int
-            modulation size for QAM
-        ensemble : int
-            number of iterations
-        seed : int | None = None
-            seed for RNG
-        dataset_path : str | None = None
-            path to dataset
-        """
-
-        super().__init__()
-        self.rng = np.random.default_rng(seed)
-        self.mod_size = mod_size
-        if os.path.isfile(dataset_path):
-            self.X, self.Y, self.labels, self.onehot_map = torch.load(dataset_path)
-        else:
-            source_bits = self.rng.integers(
-                0, 1, size=(int(ensemble*K*log2(mod_size)),), endpoint=True
-            )
-            symbols = qammod(source_bits, mod_size).reshape((ensemble, K))
-            x = np.zeros((ensemble, int(2*K)))
-            y = np.zeros((ensemble, int(2*N)))
-            print('Allocate data to save:')
-            P_in = 10 * K/N  # because of the 16-QAM
-            for idx in tqdm(range(ensemble)):
-                received = awgn(H @ symbols[idx, :], P_in, self.rng.choice(snr_dB))
-                y[idx, :] = np.hstack((received.real, received.imag))
-                x[idx, :] = np.hstack((symbols[idx, :].real,
-                                       symbols[idx, :].imag))
-            x_onehot, self.onehot_map = onehot_map(x)
-            self.X = torch.from_numpy(x)
-            self.Y = torch.from_numpy(y)
-            self.labels = torch.from_numpy(x_onehot)
-
-            torch.save([self.X, self.Y, self.labels, self.onehot_map], dataset_path)
-
-    def __len__(self):
-        return self.X.shape[0]
-    
-    def __getitem__(self, index):
-        y = self.Y[index, :]
-        label = self.labels[index, :, :]
-        return y, label
-
-
-class MLP(torch.nn.Module):
+class MLP_QPSK(torch.nn.Module):
     """Multilayer Perceptron"""
 
     def __init__(self, N, K):
         super().__init__()
         input_size = int(2*N)
         hidden_features = int(10*K)
-        output_size = int(2*K*4)
+        output_size = int(4*K)
         self.fc1 = torch.nn.Linear(input_size, hidden_features)
         self.fc2 = torch.nn.Linear(hidden_features, hidden_features)
         self.fc3 = torch.nn.Linear(hidden_features, hidden_features)
         self.fc4 = torch.nn.Linear(hidden_features, hidden_features)
         self.fc5 = torch.nn.Linear(hidden_features, hidden_features)
         self.fc6 = torch.nn.Linear(hidden_features, output_size)
-        self.logit_shape = (4, int(2*K))
+        self.logit_shape = (2, int(2*K))
 
     def forward(self, x):
         
@@ -104,39 +43,33 @@ class MLP(torch.nn.Module):
         return x
 
 
-class MLPQuantized(torch.nn.Module):
-    """Multilayer Perceptron but SOPOT"""
+class MLP_BPSK(torch.nn.Module):
+    """Multilayer Perceptron"""
 
-    def __init__(self, N: int, K: int, wl: int, fl: int):
+    def __init__(self, N, K):
         super().__init__()
-        input_size = int(2*N)
+        input_size = N
         hidden_features = int(10*K)
-        output_size = int(2*K*4)
+        output_size = int(2*K)
         self.fc1 = torch.nn.Linear(input_size, hidden_features)
         self.fc2 = torch.nn.Linear(hidden_features, hidden_features)
         self.fc3 = torch.nn.Linear(hidden_features, hidden_features)
         self.fc4 = torch.nn.Linear(hidden_features, hidden_features)
         self.fc5 = torch.nn.Linear(hidden_features, hidden_features)
-        self.fc6 = torch.nn.Linear(hidden_features, output_size)
-        self.softmax_size = (4, int(2*K))
-        self.wl = wl
-        self.fl = fl
+        # self.fc6 = torch.nn.Linear(hidden_features, hidden_features)
+        self.fc7 = torch.nn.Linear(hidden_features, output_size)
+        self.logit_shape = (2, K)
 
     def forward(self, x):
         
         x = torch.nn.functional.relu(self.fc1(x))
-        x = fixed_point_quantize(x, self.wl, self.fl)
         x = torch.nn.functional.relu(self.fc2(x))
-        x = fixed_point_quantize(x, self.wl, self.fl)
         x = torch.nn.functional.relu(self.fc3(x))
-        x = fixed_point_quantize(x, self.wl, self.fl)
         x = torch.nn.functional.relu(self.fc4(x))
-        x = fixed_point_quantize(x, self.wl, self.fl)
         x = torch.nn.functional.relu(self.fc5(x))
-        x = self.fc6(x)
-        x = fixed_point_quantize(x, self.wl, self.fl)
-        
-        x = x.reshape(x.shape[0], *self.softmax_size)
+        # x = torch.nn.functional.relu(self.fc6(x))
+        x = self.fc7(x)
+        x = x.reshape(x.shape[0], *self.logit_shape)
 
         return x
 
@@ -195,84 +128,93 @@ def test_model(dataloader: DataLoader, model: torch.nn.Module,
 
 def run_model(dataloader: DataLoader, model: torch.nn.Module, device):
     """Method to run model using pytorch"""
-    # size = len(dataloader.dataset)
-    # accuracy = 0
-    ser = 0
+    ber = 0
     model.eval()
-    onehotmap = dataloader.dataset.onehot_map
+    num_batches = len(dataloader)
+    batch_size = dataloader.batch_size
     with torch.no_grad():
         for X, y in tqdm(dataloader):
             X, y = X.to(device), y.to(device)
-            # import pdb; pdb.set_trace()
-            y_hat = model(X.float())
-            # accuracy += (y_hat.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
-            Y_pred = onehot_demap(y_hat, onehotmap)
-            Y_true = onehot_demap(y, onehotmap)
-            # import pdb; pdb.set_trace()
-            ser += (Y_pred != Y_true).mean().item()
-            # for it in range(batch_size):
-            #     bits_pred = qamdemod(Y_pred[it, :], 16).flatten()
-            #     bits_true = qamdemod(Y_true[it, :], 16).flatten()
-            #     ber += np.mean(np.abs(bits_pred - bits_true))
-            # ser += (y_hat.argmax(1) != y.argmax(1)).type(torch.float).sum().item()
-    # accuracy /= (size*64)
-    ser /= len(dataloader)
-    print(ser)
+            y_hat = model(X.float()).argmax(1)
+            y_true = y.argmax(1)
+            ber += (y_hat != y_true).sum().item()/(batch_size*y_true.shape[1])
+    ber /= num_batches
+    print(ber)
 
-    return ser
+    return ber
 
 
-def run_model_zf(dataloader: DataLoader, H: np.ndarray, device):
+def run_zf_qpsk(dataloader: DataLoader, H: np.ndarray, device):
     """Method to run model using pytorch"""
-    # size = len(dataloader.dataset)
-    # accuracy = 0
-    ser = 0
+    ber = 0
     H = torch.from_numpy(H).to(device)
     H_inv = torch.linalg.inv(torch.conj(H).T@H)
-    onehotmap = dataloader.dataset.onehot_map
     for X, y in tqdm(dataloader.dataset):
         X, y = X.to(device), y.to(device)
         X_complex = X[:H.shape[0]] + 1j*X[H.shape[0]:]
         y_hat = H_inv @ torch.conj(H).T @ X_complex
-        y_pred = decide(y_hat, dataloader.dataset.mod_size)
-        y_true = torch.from_numpy(onehot_demap(y, onehotmap)).to(device)
-        # import pdb;pdb.set_trace()
-        ser += (y_pred != y_true).sum().item()/len(y_true)
+        y_pred = torch.concat((y_hat.real, y_hat.imag), axis=-1)
+        y_pred[y_pred > 0] = 1
+        y_pred[y_pred < 0] = 0
+        y_true = y.argmax(0)
+        ber += (y_pred != y_true).sum().item()/len(y_pred)
+    ber /= len(dataloader.dataset)
+    print(ber)
+
+    return ber
+
+
+def run_zf_bpsk(dataloader: DataLoader, H: np.ndarray):
+    """Method to run model using pytorch"""
+    ser = 0
+    H = torch.from_numpy(H)
+    H_inv = torch.linalg.inv(torch.conj(H).T@H)
+    spam = torch.tensor([0., 1.])
+    for X, y in tqdm(dataloader.dataset):
+        y = y.float()
+        y_hat = H_inv @ H.T @ X
+        y_pred = torch.tensor([1 if val.item() > 0 else -1 for val in y_hat])
+        y_true = torch.tensor([1 if torch.equal(y[:, idx], spam)
+                               else -1 for idx in range(y.shape[1])])
+        ser += (y_pred != y_true).sum().item()/len(y_pred)
     ser /= len(dataloader.dataset)
     print(ser)
 
     return ser
 
 
-def run_model_quantized(dataloader: DataLoader, model: torch.nn.Module,
-                        wl: int, fl: int, device):
-    """Method to run quantized model.
-    
-    Args
-    ----
-    dataloader : DataLoader
-        dataset loader
-    model : torch.nn.Module
-        model we want to run
-    wl : int
-        wordlength for our quantization
-    fl : int
-        fractional length
-    device : str
-        device where we wanto to compute
-    """
-    size = len(dataloader.dataset)
-    accuracy = 0
+def run_model_bpsk(dataloader: DataLoader, model: torch.nn.Module, device: str):
+    """Method to run model using pytorch"""
     ser = 0
     model.eval()
+    num_batches = len(dataloader)
+    batch_size = dataloader.batch_size
     with torch.no_grad():
         for X, y in tqdm(dataloader):
-            X = fixed_point_quantize(X, wl, fl).to(device)
-            y = fixed_point_quantize(y, wl, fl).to(device)
+            X, y = X.to(device), y.to(device)
+            y_hat = model(X.float()).argmax(1)
+            y_true = y.argmax(1)
+            ser += (y_hat != y_true).sum().item()/(batch_size*y_true.shape[1])
+    ser /= num_batches
+    print(ser)
+
+    return ser
+
+
+def run_model_bpsk2(dataloader: DataLoader, model: torch.nn.Module, device: str):
+    """Method to run model using pytorch"""
+    ser = 0
+    model.eval()
+    num_batches = len(dataloader)
+    batch_size = dataloader.batch_size
+    with torch.no_grad():
+        for X, y in tqdm(dataloader):
+            X, y = X.to(device), y.to(device)
             y_hat = model(X.float())
-            accuracy += (y_hat.argmax(1) == y.argmax(1)).type(torch.float).sum().item()
-            ser += (y_hat.argmax(1) != y.argmax(1)).type(torch.float).sum().item()
-    accuracy /= (size*64)
-    ser /= (size*64)
+            y_hat[y_hat > 0] = 1
+            y_hat[y_hat <= 0] = -1
+            ser += (y_hat != y).sum().item()/(batch_size*y.shape[1])
+    ser /= num_batches
+    print(ser)
 
     return ser

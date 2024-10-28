@@ -60,7 +60,7 @@ def qammod(data: np.ndarray, mod_size: int):
             sym13 = np.array((1, 1, 0, 1))
             sym14 = np.array((1, 1, 1, 0))
             print('16QAM:')
-            for idx in tqdm(range(out_len)):
+            for idx in tqdm(range(out_len), leave=False):
                 if np.array_equal(data_vect[idx, :], sym00):  # 0000
                     data_out[idx] = -3 - 1j*3
                 elif np.array_equal(data_vect[idx, :], sym01):  # 0001

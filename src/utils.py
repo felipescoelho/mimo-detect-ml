@@ -70,6 +70,10 @@ def decide(x: torch.Tensor, mod_size: int):
     """
 
     match mod_size:
+        case 2:
+            y = torch.tensor([1 if value.item().real > 0 else -1 for
+                              value in x], dtype=torch.complex64,
+                             device=x.device)
         case 16:
             symbols = torch.tensor((-3-1j*3, -3-1j, -3+1j, -3+1j*3, -1-1j*3,
                                     -1-1j, -1+1j, -1+1j*3, 1-1j*3, 1-1j, 1+1j,
@@ -78,8 +82,9 @@ def decide(x: torch.Tensor, mod_size: int):
             eggs = symbols.tile(len(x), 1)
             spam = x.tile(16, 1)
             sausage = torch.abs(spam.T - eggs).argmin(1)
+            y = symbols[sausage]
             
-            return symbols[sausage]
+    return y
 
 
 def awgn(x: np.ndarray, P_in: float, snr_dB: float, seed: int | None = None):
@@ -103,6 +108,34 @@ def awgn(x: np.ndarray, P_in: float, snr_dB: float, seed: int | None = None):
     n *= np.sqrt(sigma2_n/2)
     
     return x + n
+
+
+def matrix_55_toeplitz_real(N: int, K: int, seed: int | None = None):
+    """Generate the matrix for the 0.55-Toeplitz channel.
+    
+    Args
+    ----
+    N : int
+        number of rows in H
+    K : int
+        number of columns in H
+    seed : int
+        a seed for the random number generator
+    """
+
+    rng = np.random.default_rng(seed)
+    h = np.array([.55**k for k in range(K)])
+    HTH = np.array([np.roll(h, k) for k in range(K)])
+    for k in range(K):
+        for kk in range(k):
+            HTH[k, kk] = HTH[kk, k]
+    _, sigma, VT = np.linalg.svd(HTH)
+    rand_mat = rng.standard_normal((N, K))
+    Q, _ = np.linalg.qr(rand_mat, mode='complete')
+    H = Q @ np.vstack((np.diag(np.sqrt(sigma)),
+                       np.zeros((N-K, K)))) @ VT
+    
+    return H
 
 
 def matrix_55_toeplitz(N: int, K: int, seed: int | None = None):
